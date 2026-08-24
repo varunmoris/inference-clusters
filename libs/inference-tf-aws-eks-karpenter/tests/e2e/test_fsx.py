@@ -7,8 +7,10 @@ populated, FS + DRA reach AVAILABLE, CSI driver placed correctly, static PV/PVC 
 and a consumer pod pinned to the FSx AZ does an RWX round-trip against /models.
 """
 
+import contextlib
 import json
 import time
+import uuid
 from collections.abc import Generator
 
 import pytest
@@ -218,15 +220,34 @@ def test_fsx_consumer_pod_mounts_and_readwrites(
     fsx_enabled: EndToEndDeployment,
     kubernetes_cluster_login: None,
 ) -> None:
-    """A pod on a Karpenter node in the FSx AZ mounts /models RWX, writes, reads, exits 0.
+    """Data-plane end-to-end: pod mounts /models RWX, sees a DRA-imported object at the
+    documented path, does a POSIX read/write round-trip.
 
-    End-to-end proof of the data plane: the SG rules allow Lustre RPC through, the CSI
-    driver hands the mount to the pod, `flock` mount options are honored, and the PVC's
-    Lustre backing accepts a POSIX write. Pod is pinned to the FSx AZ (single-AZ FS).
+    Two things covered:
+      1. DRA-visibility — the test seeds s3://<model_store>/models/<probe_dir>/probe.txt
+         BEFORE applying the pod. The DRA's auto_import (NEW/CHANGED events) propagates
+         the write into Lustre; the pod polls for the file at pod-path
+         /models/<probe_dir>/probe.txt (the DOCUMENTED path) and asserts the content
+         matches. A regression to DRA `file_system_path = "/models"` would surface the
+         file at /models/models/<probe_dir>/probe.txt and time out this poll — that's
+         the ~30-min roborev bug we walked past twice before catching. Guarded here now.
+      2. POSIX RWX — SG rules allow Lustre RPC through, the CSI driver hands the mount
+         to the pod, `flock` mount options are honored, the Lustre backing accepts a
+         write. Pinned to the FSx AZ (single-AZ FS).
     """
     workload_ns = h.jd_output(fsx_enabled, "workload_namespace")
     zone = h.jd_output(fsx_enabled, "fsx_availability_zone")
+    model_store = h.jd_output(fsx_enabled, "model_store_bucket")
     image = h.client_image(fsx_enabled)
+
+    # Per-run unique probe dir + content. Uniqueness matters because two runs against
+    # the same deployment (retry-after-failure) shouldn't reuse a stale Lustre entry.
+    # Alphanumeric only — string.Template substitution in apply_resource() balks on
+    # anything shell-active, and Lustre paths must stay clean.
+    probe_id = uuid.uuid4().hex[:12]
+    probe_dir = f"e2e-dra-probe-{probe_id}"
+    probe_key = f"models/{probe_dir}/probe.txt"
+    probe_content = f"dra-probe-{probe_id}"
 
     run_kubectl(
         "delete",
@@ -238,6 +259,9 @@ def test_fsx_consumer_pod_mounts_and_readwrites(
         "--wait=false",
         check=False,
     )
+    # Seed BEFORE the pod applies. auto_import events propagate within seconds; the
+    # pod's polling loop tolerates a few minutes as a defensive margin.
+    h.s3_put_object(model_store, probe_key, probe_content.encode())
     try:
         h.apply_resource(
             "fsx-consumer.yaml",
@@ -245,6 +269,8 @@ def test_fsx_consumer_pod_mounts_and_readwrites(
             namespace=workload_ns,
             claim_name="model-store-fsx",
             zone=zone,
+            probe_dir=probe_dir,
+            probe_content=probe_content,
         )
         # First-time mount can be slow: Karpenter must provision a CPU node in the FSx AZ
         # AND the FSx CSI node plugin must attach the Lustre client — budget 10 min.
@@ -298,3 +324,8 @@ def test_fsx_consumer_pod_mounts_and_readwrites(
             "--wait=false",
             check=False,
         )
+        # DRA auto_export_policy is empty, so the probe object stays in S3 (not
+        # written to by Lustre). Delete it here so the model_store bucket is clean
+        # for the next test run.
+        with contextlib.suppress(Exception):
+            h.s3_delete_object(model_store, probe_key)

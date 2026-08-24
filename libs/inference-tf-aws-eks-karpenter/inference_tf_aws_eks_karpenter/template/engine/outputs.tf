@@ -121,6 +121,11 @@ output "monitoring_namespace" {
   value       = local.monitoring_namespace
 }
 
+output "lws_namespace" {
+  description = "Namespace the LeaderWorkerSet controller runs in (health-check scope, only meaningful when enable_lws=true)."
+  value       = local.lws_namespace
+}
+
 # Vendored-image ECR repo names + shared tag — the health `images:` block resolves each
 # image's repository-output/tag-output from these to confirm the air-gapped vendoring
 # landed in ECR. Per-image string outputs (the jd images layer resolves one string each;

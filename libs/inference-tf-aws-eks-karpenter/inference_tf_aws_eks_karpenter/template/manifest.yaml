@@ -793,6 +793,48 @@ components:
         method: helm.show
       reconcile:
         method: helm.reconcile
+  # Opt-in components: only installed when enable_lws / enable_fsx is true. On a cluster
+  # where these are false, the Deployment/DaemonSet is missing and jd health reports the
+  # entry as unhealthy — that's the correct signal (a track that requires `lws` or `fsx`
+  # in requires.platform will fail preflight, which is what we want).
+  lws:
+    type: Deployment
+    description: LeaderWorkerSet controller (multi-node pod-group lifecycle)
+    resource-name: lws-controller-manager
+    scope: lws_namespace
+    verbs:
+      status:
+        method: k8s.apps.get-deployment-status
+      show:
+        method: k8s.apps.get-deployment
+      logs:
+        method: k8s.core.deployment-logs
+      restart:
+        method: k8s.apps.rollout-restart
+  fsx:
+    type: Deployment
+    description: FSx-for-Lustre CSI controller (attach/detach FSx volumes)
+    resource-name: fsx-csi-controller
+    scope: kube_system_namespace
+    verbs:
+      status:
+        method: k8s.apps.get-deployment-status
+      show:
+        method: k8s.apps.get-deployment
+      logs:
+        method: k8s.core.deployment-logs
+      restart:
+        method: k8s.apps.rollout-restart
+  fsx-csi-node:
+    type: DaemonSet
+    description: FSx CSI node plugin (mounts /models on Lustre, per-node)
+    resource-name: fsx-csi-node
+    scope: kube_system_namespace
+    verbs:
+      status:
+        method: k8s.apps.get-daemonset-status
+      show:
+        method: k8s.apps.get-daemonset
 # --- jd health: vendored platform images ---
 # Confirms each image the template vendors to ECR (the air-gapped failure mode) is present.
 # Workload/* images (chart-onboarded at runtime) are excluded — not known at template time.

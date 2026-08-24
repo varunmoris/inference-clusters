@@ -1,14 +1,23 @@
 # A minimal consumer pod that mounts the FSx-backed /models PVC RWX (the PVC's own
-# accessModes) and exercises a POSIX read/write round-trip to prove the Lustre data
-# plane end-to-end. Pinned to the FSx AZ (single-AZ file system) via
-# topology.kubernetes.io/zone nodeAffinity. Runs on the default Karpenter CPU NodePool —
-# the FSx path is provider-agnostic; a GPU node is unnecessary to prove the mount works.
+# accessModes) and does two things:
+#   1) DRA-visibility check — polls for a pre-seeded probe file the test put at
+#      s3://<model_store>/models/${probe_dir}/probe.txt (auto_import events =
+#      [NEW, CHANGED] pull it into Lustre) and asserts the content matches
+#      ${probe_content}. This proves S3 → Lustre → pod alignment at the documented
+#      path — a regression to DRA file_system_path="/models" would surface the
+#      file at /models/models/${probe_dir}/probe.txt and fail this assertion.
+#   2) POSIX read/write round-trip on a scratch file (the auto_export policy is
+#      empty, so the write never propagates back to S3 — safe for E2E).
+# Pinned to the FSx AZ (single-AZ file system) via topology.kubernetes.io/zone
+# nodeAffinity. Runs on the default Karpenter CPU NodePool.
 #
 # Substitutions:
-#   ${image}         — busybox via pull-through
-#   ${namespace}     — workload namespace (from Terraform output)
-#   ${claim_name}    — FSx PVC name (from the storage chart: fsx.claimName)
-#   ${zone}          — FSx AZ (from Terraform output fsx_availability_zone)
+#   ${image}          — busybox via pull-through
+#   ${namespace}      — workload namespace (from Terraform output)
+#   ${claim_name}     — FSx PVC name (from the storage chart: fsx.claimName)
+#   ${zone}           — FSx AZ (from Terraform output fsx_availability_zone)
+#   ${probe_dir}      — per-run unique subdir under models/ (pod expects it at /models/${probe_dir})
+#   ${probe_content}  — expected content of ${probe_dir}/probe.txt (the test wrote it)
 apiVersion: v1
 kind: Pod
 metadata:
@@ -43,8 +52,38 @@ spec:
           echo "[fsx-consumer] uname -a:"; uname -a
           echo "[fsx-consumer] /models mount info:"
           mount | grep -E "on /models" || (echo "no /models mount" >&2; exit 1)
-          echo "[fsx-consumer] /models listing (may be empty on a fresh DRA):"
-          ls -la /models
+
+          # --- DRA-visibility probe ---
+          # The test seeded s3://<model_store>/models/${probe_dir}/probe.txt with
+          # ${probe_content} before applying this pod. DRA auto_import propagates
+          # new S3 objects into Lustre within seconds; poll until the file appears
+          # at the DOCUMENTED path /models/${probe_dir}/probe.txt (not one level
+          # deeper — a broken DRA file_system_path would put it at
+          # /models/models/${probe_dir}/probe.txt and this loop would time out).
+          probe_path=/models/${probe_dir}/probe.txt
+          echo "[fsx-consumer] waiting for DRA to surface $probe_path"
+          for i in $(seq 1 60); do
+            if [ -f "$probe_path" ]; then
+              echo "[fsx-consumer] probe file appeared after $i polls (~$((i * 3))s)"
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "[fsx-consumer] FAIL: DRA never surfaced $probe_path in ~180s" >&2
+              echo "[fsx-consumer] (regression to nested /models/models layout?)" >&2
+              ls -la /models/${probe_dir}/ 2>&1 || true
+              ls -la /models/ 2>&1 || true
+              exit 1
+            fi
+            sleep 3
+          done
+          actual=$(cat "$probe_path")
+          if [ "$actual" != "${probe_content}" ]; then
+            echo "[fsx-consumer] FAIL: probe content mismatch — got $actual, expected ${probe_content}" >&2
+            exit 1
+          fi
+          echo "[fsx-consumer] DRA content check OK"
+
+          # --- POSIX RWX round-trip ---
           echo "[fsx-consumer] writing scratch file..."
           echo "hello-fsx-write-check" > /models/.e2e-write-check
           echo "[fsx-consumer] reading it back:"
