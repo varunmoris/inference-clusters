@@ -895,6 +895,36 @@ def test_fsx_consumer_template_renders_with_expected_subs() -> None:
     assert "$$" not in rendered, "raw $$ leaked to rendered output (missed a substitution)"
 
 
+def test_fsx_vpc_endpoint_gated_on_enable_fsx() -> None:
+    """The FSx interface VPC endpoint MUST exist and be gated on enable_fsx.
+
+    On the endpoints-only VPC posture (var.enable_nat_gateway=false, the default),
+    private subnets have NO internet route. The hydrator's `aws fsx create-data-
+    repository-task` call would hang against fsx.<region>.amazonaws.com until the
+    Job's activeDeadlineSeconds fires — a silent DoS on the entire hydration path.
+    JGuinegagne blocking-reliability finding on d7cfd9c.
+
+    The endpoint MUST use `private_dns_enabled = true` so the AWS SDK resolves
+    fsx.<region>.amazonaws.com to the endpoint transparently (no client tuning).
+    """
+    content = (ENGINE / "platform_fsx.tf").read_text()
+    endpoint = _resource(content, "aws_vpc_endpoint", "fsx")
+    assert "count = var.enable_fsx" in endpoint, (
+        "aws_vpc_endpoint.fsx must be gated on var.enable_fsx (~$14/mo per endpoint; "
+        "only pay it when FSx is actually on)"
+    )
+    assert re.search(r'service_name\s*=\s*"com\.amazonaws\.\$\{data\.aws_region\.current\.id\}\.fsx"', endpoint), (
+        "endpoint service_name must be com.amazonaws.<region>.fsx (the FSx interface endpoint)"
+    )
+    assert "private_dns_enabled = true" in endpoint, (
+        "private_dns_enabled must be true so the SDK resolves fsx.<region>.amazonaws.com "
+        "to the endpoint without client tuning"
+    )
+    assert 'vpc_endpoint_type   = "Interface"' in endpoint or 'vpc_endpoint_type = "Interface"' in endpoint, (
+        "vpc_endpoint_type must be Interface (fsx has no gateway endpoint)"
+    )
+
+
 def test_fsx_sg_rules_are_sg_referenced_not_cidr() -> None:
     """FSx SG rules MUST source by SG reference (not CIDR).
 
@@ -1053,31 +1083,66 @@ def test_fsx_hydration_job_is_gated_and_scoped() -> None:
 
 
 def test_fsx_hydrator_iam_is_scoped_to_our_fs() -> None:
-    """The fsx_hydrator IAM policy MUST scope DRT actions to THIS file system's ARN,
-    not `Resource: *`. Two coexisting deployments in one account must never be able to
-    fire DRTs against each other's file systems via the hydrator SA.
+    """The fsx_hydrator IAM policy MUST split DRT actions into two statements so that
+    Cancel/Describe are scoped per-deployment (not just Create). Roborev Medium on
+    d7cfd9c: single-statement version granted Cancel on `task/*` with no condition,
+    letting a compromised pod in deployment A cancel B's in-flight DRTs (cross-
+    deployment DoS on the exact 'two clusters in one account' case the design
+    claims to defend).
+
+    Contract:
+      - Create + TagResource on OUR file system's ARN (Create is where the DRT's
+        tags are set — DeploymentId lands then).
+      - Describe/Cancel on task/* WITH `aws:ResourceTag/DeploymentId` = our
+        random_id.postfix.hex — the tag on the DRT is what scopes ops per-deployment.
+      - S3 PutObject on the DEDICATED reports bucket (not the model_store weights
+        bucket — JGuinegagne blocking-security finding).
+      - NO `s3:PutObjectAcl` grant (inert under the bucket's BlockPublicAcls).
     """
     content = (ENGINE / "platform_fsx_hydrate.tf").read_text()
     doc = _extract_block(content, "data", "aws_iam_policy_document", "fsx_hydrator")
-    # Positive: our FS ARN is in the DRT statement's resources.
-    assert "aws_fsx_lustre_file_system.shared[0].arn" in doc, (
-        "fsx_hydrator DRT statement must resource-scope to our FS ARN"
+
+    # The two DRT statements exist by sid, not one combined statement.
+    assert "DrtCreateOnOurFileSystem" in doc, (
+        "fsx_hydrator must split DRT into a Create-on-our-FS statement (sid=DrtCreateOnOurFileSystem)"
     )
-    # Positive: DRT actions granted.
+    assert "DrtOpsOnOurTasksOnly" in doc, (
+        "fsx_hydrator must split DRT into a task-ops statement (sid=DrtOpsOnOurTasksOnly) so "
+        "Cancel/Describe scope by ResourceTag, not just resource ARN"
+    )
+
+    # Create + TagResource on our FS ARN, NOT on task/*.
+    assert "aws_fsx_lustre_file_system.shared[0].arn" in doc, (
+        "fsx_hydrator Create statement must resource-scope to our FS ARN"
+    )
+
+    # All DRT actions granted somewhere in the doc.
     for action in ("fsx:CreateDataRepositoryTask", "fsx:DescribeDataRepositoryTasks", "fsx:CancelDataRepositoryTask"):
         assert action in doc, f"fsx_hydrator must grant {action}"
-    # Negative: no `Resource: *` on the DRT statement — grep the whole doc for it.
-    assert not re.search(r'resources\s*=\s*\[\s*"\*"\s*\]', doc), (
-        "fsx_hydrator DRT statement must NOT use Resource: * — scope to our FS ARN"
+
+    # Ops statement uses the ResourceTag/DeploymentId condition — this is the
+    # single load-bearing guard against cross-deployment cancel.
+    assert re.search(r"aws:ResourceTag/DeploymentId", doc), (
+        "fsx_hydrator Describe/Cancel MUST be conditioned on aws:ResourceTag/DeploymentId "
+        "— without it, a compromised pod can Cancel any DRT in the account"
     )
-    # S3 PutObject scoped to the report prefix only (referenced via the local).
-    assert "local.fsx_hydrate_report_prefix" in doc, (
-        "fsx_hydrator S3 PutObject must scope to the local.fsx_hydrate_report_prefix path"
+    assert "random_id.postfix.hex" in doc, (
+        "the DeploymentId tag value must be random_id.postfix.hex (this deployment's id)"
     )
-    # And the local's literal value must be the fsx-drt-reports subpath.
-    content_full = (ENGINE / "platform_fsx_hydrate.tf").read_text()
-    assert re.search(r'fsx_hydrate_report_prefix\s*=\s*"fsx-drt-reports"', content_full), (
-        "local.fsx_hydrate_report_prefix must equal 'fsx-drt-reports'"
+
+    # Reports bucket must be the dedicated one, not model_store.
+    assert "module.fsx_drt_reports[0].bucket_arn" in doc, (
+        "DRT reports must land in the dedicated fsx_drt_reports bucket, not model_store"
+    )
+    assert "module.model_store.bucket_arn" not in doc, (
+        "fsx_hydrator MUST NOT reference model_store bucket — DRT reports belong in the "
+        "dedicated fsx_drt_reports bucket"
+    )
+
+    # s3:PutObjectAcl is inert under BlockPublicAcls, and dropping it minimizes the
+    # allow-list.
+    assert "s3:PutObjectAcl" not in doc, (
+        "s3:PutObjectAcl is inert under the bucket's BlockPublicAcls and must be dropped"
     )
 
 
@@ -1211,7 +1276,7 @@ def test_s3_mount_platform_info_configmap_is_discoverable() -> None:
 def test_fsx_observability_alarms_and_grafana_ds() -> None:
     """Observability layer (platform_fsx_observability.tf) MUST ship:
     - a CloudWatch log-metric-filter + alarm on FSx event log WARN/ERROR/FAILED
-    - a FreeStorageCapacity alarm keyed on 20% of provisioned capacity
+    - a FreeDataStorageCapacity alarm keyed on 20% of provisioned capacity
     - read + write throughput-saturation alarms at 70% of FS ceiling (15 min sustained)
     - a Grafana CloudWatch data source with an IAM policy scoped to AWS/FSx
     """
@@ -1220,6 +1285,16 @@ def test_fsx_observability_alarms_and_grafana_ds() -> None:
     for alarm in ("fsx_events", "fsx_free_capacity", "fsx_read_saturation", "fsx_write_saturation"):
         block = _resource(content, "aws_cloudwatch_metric_alarm", alarm)
         assert "count = var.enable_fsx" in block, f"alarm '{alarm}' must be gated on enable_fsx"
+    # The capacity alarm's metric name MUST be FreeDataStorageCapacity — the Lustre-
+    # specific one. FreeStorageCapacity (no "Data") is FSx-Windows/ONTAP and Lustre
+    # never emits it, so an alarm on that name sits permanently in OK with
+    # `treat_missing_data = notBreaching`. Roborev Medium finding on `d7cfd9c`.
+    capacity_block = _resource(content, "aws_cloudwatch_metric_alarm", "fsx_free_capacity")
+    assert re.search(r'metric_name\s*=\s*"FreeDataStorageCapacity"', capacity_block), (
+        "fsx_free_capacity alarm MUST use metric_name = FreeDataStorageCapacity "
+        "(the Lustre metric). FreeStorageCapacity is Windows/ONTAP and Lustre never "
+        "emits it — alarm would sit permanently in OK."
+    )
     # Saturation alarms MUST divide by the derived FS ceiling local (not hardcoded)
     # so bumping fsx_per_unit_storage_throughput auto-retunes them.
     for alarm in ("fsx_read_saturation", "fsx_write_saturation"):

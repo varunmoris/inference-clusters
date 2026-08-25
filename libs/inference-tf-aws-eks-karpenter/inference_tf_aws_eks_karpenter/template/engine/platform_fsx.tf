@@ -176,6 +176,31 @@ resource "aws_cloudwatch_log_group" "fsx" {
   tags              = local.combined_tags
 }
 
+# --- FSx interface VPC endpoint (endpoints-only VPC posture) ---
+#
+# On the default endpoints-only posture (var.enable_nat_gateway = false) the private
+# subnets have NO route to the internet. The hydrator's `aws fsx create-data-repository-task`
+# call then hangs against fsx.<region>.amazonaws.com until the Job's activeDeadlineSeconds
+# fires — the JGuinegagne blocking-reliability finding on d7cfd9c. Add the FSx interface
+# endpoint co-located with the rest of the platform's interface endpoints (see
+# modules/vpc/main.tf `interface_endpoints`), gated on `enable_fsx` so the ~$14/mo cost
+# floor only lands on FSx-enabled clusters. private_dns_enabled = true so the AWS SDK
+# resolves fsx.<region>.amazonaws.com to the endpoint transparently (no client tuning).
+resource "aws_vpc_endpoint" "fsx" {
+  count = var.enable_fsx ? 1 : 0
+
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.${data.aws_region.current.id}.fsx"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = module.vpc.private_subnet_ids
+  security_group_ids  = [module.vpc.endpoint_security_group_id]
+  private_dns_enabled = true
+
+  tags = merge(local.combined_tags, {
+    Name = "${local.resource_name_prefix}-vpce-fsx"
+  })
+}
+
 # --- File system: PERSISTENT_2 SSD + LZ4 + DRA-capable ---
 #
 # storage_capacity × per_unit_storage_throughput / 1024 = aggregate MB/s.

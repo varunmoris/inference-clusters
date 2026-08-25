@@ -28,53 +28,93 @@ locals {
     p => replace(replace(p, "/", "-"), "_", "-")
   }
 
-  # S3 URI the DRT completion report is written to (per-prefix subpath under the
-  # existing model_store bucket). PutObject scope in the hydrator IAM points here.
-  fsx_hydrate_report_prefix = "fsx-drt-reports"
-  fsx_hydrate_report_uri    = "s3://${module.model_store.bucket_name}/${local.fsx_hydrate_report_prefix}"
+  # DRT completion reports land in a DEDICATED bucket (per JGuinegagne review):
+  # ops artifacts have no business in the model_store (weights) bucket — separation
+  # of concerns + independent lifecycle (reports auto-expire at 30d for postmortem
+  # window; weights are write-once). URI passed to the hydration script via env.
+  fsx_hydrate_report_uri = local.fsx_hydrate_enabled ? "s3://${module.fsx_drt_reports[0].bucket_name}" : ""
+}
+
+# Dedicated S3 bucket for FSx DRT completion reports. Gated on hydration enabled —
+# no bucket unless the operator has actually declared a prefix to hydrate.
+# Lifecycle: expire after 30d (reports are postmortem-only; DRT lifecycle is already
+# logged in-cluster via the Job's stdout).
+module "fsx_drt_reports" {
+  count  = local.fsx_hydrate_enabled ? 1 : 0
+  source = "./modules/s3_bucket"
+
+  bucket_name_prefix = "${local.resource_name_prefix}-fsx-drt-reports"
+  combined_tags      = local.combined_tags
+  lifecycle_rule = {
+    id                                     = "expire-drt-reports"
+    expiration_days                        = 30
+    noncurrent_version_expiration_days     = 30
+    abort_incomplete_multipart_upload_days = 7
+  }
 }
 
 # --- Hydrator IAM: Pod Identity, tightly scoped ---
 #
-# fsx:CreateDataRepositoryTask/Describe/Cancel scoped to this file system's ARN
-# via aws:ResourceTag/DeploymentId — matches the pattern the Karpenter controller
-# role uses to scope EC2 actions per-cluster. Refuses cross-deployment DRT ops
-# even if two clusters coexist in one account.
+# Two DRT statements so cancel/describe are BOTH scoped to this deployment (roborev
+# Medium on d7cfd9c):
+#   1. CreateDataRepositoryTask + TagResource — pinned to this file system's ARN.
+#      Create is where the task's initial tags are set; we require the DRT to carry
+#      DeploymentId at birth.
+#   2. Describe/Cancel — must be `task/*` because AWS returns cross-deployment task
+#      IDs from Describe; scope via `aws:ResourceTag/DeploymentId = <this deployment>`
+#      so a compromised pod in deployment A cannot Cancel deployment B's in-flight
+#      DRT (the previous single-statement version granted Cancel on `task/*` with
+#      NO condition — cross-deployment DoS surface).
 data "aws_iam_policy_document" "fsx_hydrator" {
   count = local.fsx_hydrate_enabled ? 1 : 0
 
   statement {
-    sid    = "DrtOnOurFileSystem"
+    sid    = "DrtCreateOnOurFileSystem"
     effect = "Allow"
     actions = [
       "fsx:CreateDataRepositoryTask",
-      "fsx:DescribeDataRepositoryTasks",
-      "fsx:CancelDataRepositoryTask",
       "fsx:TagResource",
     ]
-    resources = [
-      aws_fsx_lustre_file_system.shared[0].arn,
-      # DRT ARNs are of the form arn:aws:fsx:<region>:<account>:task/task-*.
-      # DescribeDataRepositoryTasks needs read on the task resource itself.
-      "arn:${data.aws_partition.current.partition}:fsx:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task/*",
-    ]
+    resources = [aws_fsx_lustre_file_system.shared[0].arn]
   }
 
   statement {
-    sid    = "PutDrtReports"
+    sid    = "DrtOpsOnOurTasksOnly"
     effect = "Allow"
     actions = [
-      "s3:PutObject",
-      "s3:PutObjectAcl",
+      "fsx:DescribeDataRepositoryTasks",
+      "fsx:CancelDataRepositoryTask",
     ]
-    resources = ["${module.model_store.bucket_arn}/${local.fsx_hydrate_report_prefix}/*"]
+    resources = [
+      # DRT ARNs are of the form arn:aws:fsx:<region>:<account>:task/task-*.
+      # Describe returns cross-account task IDs even under a resource-scoped grant,
+      # so we accept task/* and rely on the ResourceTag condition below.
+      "arn:${data.aws_partition.current.partition}:fsx:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task/*",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/DeploymentId"
+      values   = [random_id.postfix.hex]
+    }
+  }
+
+  # PutObject only (no PutObjectAcl — the DRT report bucket has BlockPublicAcls +
+  # BlockPublicPolicy set at the module level, so PutObjectAcl is inert and grants
+  # nothing except an extra allow-list entry). Report URI is a dedicated bucket now
+  # (see the fsx_drt_reports module), so this is scoped to that bucket, not
+  # model_store — ops artifacts don't share a bucket with weights.
+  statement {
+    sid       = "PutDrtReports"
+    effect    = "Allow"
+    actions   = ["s3:PutObject"]
+    resources = ["${module.fsx_drt_reports[0].bucket_arn}/*"]
   }
 
   statement {
     sid       = "DrtReportBucketLocation"
     effect    = "Allow"
     actions   = ["s3:GetBucketLocation"]
-    resources = [module.model_store.bucket_arn]
+    resources = [module.fsx_drt_reports[0].bucket_arn]
   }
 }
 
@@ -239,6 +279,14 @@ resource "kubernetes_job_v1" "fsx_hydrate" {
             name  = "AWS_REGION"
             value = data.aws_region.current.id
           }
+          env {
+            # Tag every DRT with the deployment id — the hydrator's IAM policy
+            # scopes DescribeDataRepositoryTasks + CancelDataRepositoryTask via
+            # aws:ResourceTag/DeploymentId, so this tag is what makes those grants
+            # per-deployment rather than account-wide (roborev Medium d7cfd9c).
+            name  = "DEPLOYMENT_ID"
+            value = random_id.postfix.hex
+          }
 
           command = ["/bin/bash", "-c"]
           args = [
@@ -259,11 +307,15 @@ resource "kubernetes_job_v1" "fsx_hydrate" {
               # mounts Lustre root at /mnt/models, so /mnt/models/$PREFIX below is
               # the SAME Lustre location the DRT is targeting here.
               echo "[hydrate] create DRT IMPORT_METADATA_FROM_REPOSITORY for /$PREFIX"
+              # --tags Key=DeploymentId,Value=... is load-bearing: the hydrator's
+              # IAM policy scopes Describe/Cancel via `aws:ResourceTag/DeploymentId`,
+              # so a DRT without this tag would then fail its own Describe polls.
               TASK_ID=$(aws fsx create-data-repository-task \
                 --file-system-id "$FS_ID" \
                 --type IMPORT_METADATA_FROM_REPOSITORY \
                 --paths "/$PREFIX" \
                 --report "Enabled=true,Path=$REPORT_URI/$SLUG,Format=REPORT_CSV_20191124,Scope=FAILED_FILES_ONLY" \
+                --tags "Key=DeploymentId,Value=$DEPLOYMENT_ID" \
                 --region "$AWS_REGION" \
                 --query 'DataRepositoryTask.TaskId' --output text)
               echo "[hydrate] DRT task-id: $TASK_ID"

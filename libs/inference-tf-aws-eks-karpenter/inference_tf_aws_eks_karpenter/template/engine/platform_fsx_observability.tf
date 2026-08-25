@@ -62,18 +62,22 @@ resource "aws_cloudwatch_metric_alarm" "fsx_events" {
   tags = local.combined_tags
 }
 
-# --- Alarm 2: FreeStorageCapacity < 20% headroom ---
+# --- Alarm 2: FreeDataStorageCapacity < 20% headroom ---
 #
-# FSx pushes FreeStorageCapacity (bytes) to CloudWatch every minute. Threshold =
-# 20% of provisioned capacity (var.fsx_storage_capacity_gib GiB → bytes → 20%).
+# FSx *for Lustre* publishes `FreeDataStorageCapacity` (bytes free on the OSTs) once
+# per minute. NOT `FreeStorageCapacity` — that's the FSx for Windows/ONTAP metric
+# and Lustre never emits it, so an alarm on that name sits permanently in OK with
+# `treat_missing_data = notBreaching` regardless of how full the FS gets (silent
+# failure caught in roborev on `d7cfd9c`).
+# Threshold: 20% of provisioned capacity (var.fsx_storage_capacity_gib GiB → bytes → 20%).
 # 5-minute average avoids flapping on transient scratch bursts.
 resource "aws_cloudwatch_metric_alarm" "fsx_free_capacity" {
   count = var.enable_fsx ? 1 : 0
 
   alarm_name         = "${local.resource_name_prefix}-fsx-low-capacity"
-  alarm_description  = "FSx for Lustre FreeStorageCapacity dropped below 20% of provisioned. At 100%-full the FS returns ENOSPC on writes; workloads writing to /models will 500. Increase fsx_storage_capacity_gib or purge stale files."
+  alarm_description  = "FSx for Lustre FreeDataStorageCapacity dropped below 20% of provisioned. At 100%-full the FS returns ENOSPC on writes; workloads writing to /models will 500. Increase fsx_storage_capacity_gib or purge stale files."
   namespace          = "AWS/FSx"
-  metric_name        = "FreeStorageCapacity"
+  metric_name        = "FreeDataStorageCapacity"
   statistic          = "Average"
   period             = 300
   evaluation_periods = 2 # 10 min sustained
