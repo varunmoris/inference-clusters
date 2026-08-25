@@ -9,6 +9,7 @@ merely mirrors them is churn, not a guard. Parsing is regex + brace-matching (no
 """
 
 import re
+import string
 import subprocess
 
 import yaml
@@ -864,6 +865,34 @@ def test_fsx_hydration_drt_paths_match_lustre_layout() -> None:
         "hydration script must operate on /mnt/models/$PREFIX (the pod path corresponding "
         "to Lustre /$PREFIX given the pod mounts Lustre root at /mnt/models)"
     )
+
+
+def test_fsx_consumer_template_renders_with_expected_subs() -> None:
+    """apply_resource() feeds tests/e2e/resources/fsx-consumer.yaml through
+    string.Template.substitute() with a fixed set of placeholders. Every `$var` /
+    `${var}` in the template that is NOT one of those placeholders MUST be `$$var`
+    (shell literal) — otherwise the render raises KeyError at CI time (which is a
+    ~30-min feedback loop). This test catches the class of bug locally.
+    """
+    resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-consumer.yaml").read_text()
+    # Same kwargs test_fsx_consumer_pod_mounts_and_readwrites passes in.
+    subs = {
+        "image": "1234.dkr.ecr.us-west-2.amazonaws.com/ecr-public/docker/library/busybox:1.36",
+        "namespace": "inference",
+        "claim_name": "model-store-fsx",
+        "zone": "us-west-2a",
+        "probe_dir": "e2e-dra-probe-abc123",
+        "probe_content": "dra-probe-abc123",
+    }
+    # This raises KeyError if the template references an unknown placeholder — the
+    # bug hit in e2e run 32761818991 (unescaped `$probe_path` etc.).
+    rendered = string.Template(resource).substitute(**subs)
+    # Sanity checks on the rendered output.
+    assert "e2e-dra-probe-abc123" in rendered, "probe_dir substitution didn't land"
+    assert "hello-fsx-write-check" in rendered, "shell literal string got clobbered by substitution"
+    # No unescaped shell vars remain — `$$` is the escape for the raw `$` in
+    # string.Template. If any `$$` survived to the rendered output, that's a bug.
+    assert "$$" not in rendered, "raw $$ leaked to rendered output (missed a substitution)"
 
 
 def test_fsx_sg_rules_are_sg_referenced_not_cidr() -> None:

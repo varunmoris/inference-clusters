@@ -60,25 +60,28 @@ spec:
           # at the DOCUMENTED path /models/${probe_dir}/probe.txt (not one level
           # deeper — a broken DRA file_system_path would put it at
           # /models/models/${probe_dir}/probe.txt and this loop would time out).
+          # `$$` escapes for python string.Template — shell reads it as a literal dollar sign.
           probe_path=/models/${probe_dir}/probe.txt
-          echo "[fsx-consumer] waiting for DRA to surface $probe_path"
-          for i in $(seq 1 60); do
-            if [ -f "$probe_path" ]; then
-              echo "[fsx-consumer] probe file appeared after $i polls (~$((i * 3))s)"
+          echo "[fsx-consumer] waiting for DRA to surface $$probe_path"
+          i=1
+          while [ "$$i" -le 60 ]; do
+            if [ -f "$$probe_path" ]; then
+              echo "[fsx-consumer] probe file appeared after $$i polls"
               break
             fi
-            if [ "$i" = "60" ]; then
-              echo "[fsx-consumer] FAIL: DRA never surfaced $probe_path in ~180s" >&2
+            if [ "$$i" = "60" ]; then
+              echo "[fsx-consumer] FAIL: DRA never surfaced $$probe_path in ~180s" >&2
               echo "[fsx-consumer] (regression to nested /models/models layout?)" >&2
               ls -la /models/${probe_dir}/ 2>&1 || true
               ls -la /models/ 2>&1 || true
               exit 1
             fi
             sleep 3
+            i=$$((i + 1))
           done
-          actual=$(cat "$probe_path")
-          if [ "$actual" != "${probe_content}" ]; then
-            echo "[fsx-consumer] FAIL: probe content mismatch — got $actual, expected ${probe_content}" >&2
+          actual=$$(cat "$$probe_path")
+          if [ "$$actual" != "${probe_content}" ]; then
+            echo "[fsx-consumer] FAIL: probe content mismatch — expected ${probe_content}" >&2
             exit 1
           fi
           echo "[fsx-consumer] DRA content check OK"
