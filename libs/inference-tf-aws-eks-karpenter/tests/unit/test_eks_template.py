@@ -833,10 +833,9 @@ def test_fsx_uses_persistent2_ssd_lz4_with_dra() -> None:
     # file_system_path MUST be "/" (Lustre root ⇄ S3 models/ prefix). Any other value
     # (notably "/models") double-nests the imported content — S3 `models/foo.bin` ends
     # up at Lustre `/models/foo.bin` while the pod (which mounts Lustre root at
-    # /models) then sees it at `/models/models/foo.bin`. The hydration Job's
-    # `/mnt/models/$PREFIX` path would then refer to a nonexistent Lustre `/$PREFIX`,
-    # take the "doesn't exist" fallback branch, and touch the sentinel while warming
-    # zero bytes (roborev's High finding, tracked across every pre-fix commit).
+    # /models) then sees it at `/models/models/foo.bin`. The hydration Job would then
+    # operate on a nonexistent Lustre subtree and silently no-op (roborev's High
+    # finding, tracked across every pre-fix commit).
     assert re.search(r'file_system_path\s*=\s*"/"(?!\w)', dra), (
         'DRA file_system_path MUST be "/" so Lustre root maps directly to the '
         "S3 models/ prefix — the pod mounts Lustre root at /models, so S3 "
@@ -845,26 +844,112 @@ def test_fsx_uses_persistent2_ssd_lz4_with_dra() -> None:
     )
 
 
-def test_fsx_hydration_drt_paths_match_lustre_layout() -> None:
-    """The DRT in the hydration Job MUST target Lustre `/$PREFIX` (not `/models/$PREFIX`).
+def test_fsx_hydrate_rgd_shape() -> None:
+    """The FsxHydrate KRO RGD (charts/storage/templates/fsx-hydrate-rgd.yaml) is the
+    track-facing hydration primitive: a track composes a FsxHydrate CR into its own
+    graph next to the workload it wants pre-warmed, and KRO expands each CR to one
+    Job doing `lfs hsm_restore` on models/<prefix> then touching a `.hydrated-<slug>`
+    sentinel. Runs at TRACK-DEPLOY time (post onboarder), NOT `jd up` time — the
+    prior TF-managed Job fired at apply time when no weights were in S3 yet
+    (lhnealreilly blocking review on d7cfd9c).
 
-    With DRA file_system_path="/", Lustre root == the S3 models/ prefix, so a workload
-    prefix like "model-a" lives at Lustre "/model-a". The DRT's `--paths` argument is
-    a Lustre-absolute path; passing "/models/$PREFIX" here refreshes a Lustre subtree
-    that doesn't exist under our DRA mapping — the DRT reports SUCCEEDED (empty scope)
-    while nothing is warmed. This guard fails loud if someone regresses the path.
+    Contract:
+      - Gated on .Values.fsx.enabled (only makes sense on FSx clusters).
+      - RGD kind is FsxHydrate with a required spec.prefix.
+      - Renders a batch/v1 Job that mounts the platform-owned FSx PVC.
+      - Job AZ-pins to .Values.fsx.availabilityZone (single-AZ FSx tax).
+      - Job body does hsm_restore + sentinel touch.
+      - Job sets activeDeadlineSeconds + ttlSecondsAfterFinished.
     """
-    content = (ENGINE / "platform_fsx_hydrate.tf").read_text()
-    assert re.search(r'--paths\s+"/\$PREFIX"', content), (
-        'hydration DRT --paths MUST be "/$PREFIX" (matching DRA file_system_path="/"). '
-        'Using "/models/$PREFIX" targets a nonexistent Lustre subtree and silently no-ops.'
+    tmpl_path = CHARTS / "storage" / "templates" / "fsx-hydrate-rgd.yaml"
+    assert tmpl_path.exists(), "fsx-hydrate-rgd.yaml must ship in the storage chart"
+    tmpl = tmpl_path.read_text()
+
+    # Gate on FSx being enabled.
+    assert "{{- if .Values.fsx.enabled }}" in tmpl, (
+        "fsx-hydrate-rgd.yaml must be gated on .Values.fsx.enabled — no FSx means no PVC to mount"
     )
-    # The pod-side setstripe/find/hsm_state ops must stay on /mnt/models/$PREFIX
-    # (== Lustre /$PREFIX via the pod's mount of Lustre root at /mnt/models).
-    assert re.search(r"/mnt/models/\$PREFIX", content), (
-        "hydration script must operate on /mnt/models/$PREFIX (the pod path corresponding "
-        "to Lustre /$PREFIX given the pod mounts Lustre root at /mnt/models)"
+
+    # KRO RGD with the FsxHydrate kind and a required prefix schema field.
+    assert "kind: ResourceGraphDefinition" in tmpl, "must declare a KRO ResourceGraphDefinition"
+    assert re.search(r"kind:\s*FsxHydrate", tmpl), "RGD must define the FsxHydrate kind"
+    assert re.search(r"prefix:\s*string\s*\|\s*required=true", tmpl), (
+        "FsxHydrate.spec.prefix must be a required string (the caller-supplied models/<prefix>)"
     )
+
+    # Renders a batch Job (not a Deployment, not a Pod) — hydration is one-shot.
+    assert re.search(r"apiVersion:\s*batch/v1", tmpl) and "kind: Job" in tmpl, (
+        "RGD must render a batch/v1 Job (one-shot; not a Deployment)"
+    )
+    # PVC name and AZ come from the storage chart values (single source of truth
+    # shared with fsx-mount.yaml — no duplication of the FSx AZ selection).
+    assert "{{ .Values.fsx.claimName" in tmpl, "Job must mount the platform-owned FSx PVC via .Values.fsx.claimName"
+    assert "{{ .Values.fsx.availabilityZone" in tmpl, (
+        "Job's nodeAffinity zone must come from .Values.fsx.availabilityZone (same source as PV)"
+    )
+    assert "topology.kubernetes.io/zone" in tmpl, "Job must nodeAffinity-pin to the FSx AZ"
+
+    # Load-bearing script bits: byte-warm + sentinel.
+    assert "lfs hsm_restore" in tmpl, "hydration script must fan out lfs hsm_restore on the prefix"
+    assert re.search(r"touch\s+.*hydrated-", tmpl), "hydration script must touch the .hydrated-<slug> sentinel"
+
+    # Safety caps — matches the equivalent settings on any TF-side Job.
+    assert "activeDeadlineSeconds" in tmpl, "Job must set activeDeadlineSeconds (hard kill for stuck restores)"
+    assert "ttlSecondsAfterFinished" in tmpl, "Job must set ttlSecondsAfterFinished (postmortem-then-reap)"
+
+    # Storage chart wiring MUST pass the hydrator image via the pull-through
+    # cache — nodes on the endpoints-only VPC can't reach public.ecr.aws.
+    storage = _resource((ENGINE / "platform_storage.tf").read_text(), "helm_release", "storage")
+    assert '"fsx.hydrator.image"' in storage, (
+        "helm_release.storage must set fsx.hydrator.image (the container image the RGD renders into the Job)"
+    )
+    assert "ecr-public/amazonlinux/amazonlinux" in storage, (
+        "hydrator image must be sourced via the ECR pull-through cache (nodes can't reach public.ecr.aws directly)"
+    )
+
+    # And the storage release must depend on the KRO controller release, since
+    # this template registers a kro.run/v1alpha1 kind whose CRD ships with it.
+    assert "helm_release.kro" in storage, (
+        "helm_release.storage must depend_on helm_release.kro — the FsxHydrate RGD requires the KRO CRD"
+    )
+
+
+def test_fsx_hydrate_cr_template_renders_with_expected_subs() -> None:
+    """apply_resource() feeds tests/e2e/resources/fsx-hydrate-cr.yaml through
+    string.Template.substitute() with a fixed set of placeholders. Every `$var`
+    / `${var}` in the template that is NOT one of those placeholders MUST be
+    `$$var` (shell literal) — otherwise the render raises KeyError at CI time
+    (~30-min feedback loop). This test catches that class of bug locally.
+    """
+    resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-hydrate-cr.yaml").read_text()
+    subs = {
+        "namespace": "inference",
+        "cr_name": "hydrate-abc123",
+        "prefix": "hydrate-e2e-abc123",
+    }
+    rendered = string.Template(resource).substitute(**subs)
+    assert "hydrate-abc123" in rendered, "cr_name substitution didn't land"
+    assert "prefix: hydrate-e2e-abc123" in rendered, "prefix substitution didn't land"
+
+
+def test_fsx_hydrate_probe_template_renders_with_expected_subs() -> None:
+    """Same shape-check for tests/e2e/resources/fsx-hydrate-probe.yaml."""
+    resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-hydrate-probe.yaml").read_text()
+    subs = {
+        "pod": "fsx-hydrate-probe-abc123",
+        "namespace": "inference",
+        "image": "1234.dkr.ecr.us-west-2.amazonaws.com/ecr-public/amazonlinux/amazonlinux:2023",
+        "zone": "us-west-2a",
+        "claim_name": "model-store-fsx",
+        "sentinel_path": "/models/.hydrated-hydrate-e2e-abc123",
+        "seed_path": "/models/hydrate-e2e-abc123/data.bin",
+    }
+    rendered = string.Template(resource).substitute(**subs)
+    assert "fsx-hydrate-probe-abc123" in rendered, "pod substitution didn't land"
+    assert "/models/.hydrated-hydrate-e2e-abc123" in rendered, "sentinel_path substitution didn't land"
+    # `$$` -> `$` after render; anything still spelled `$$` here would mean the
+    # source used `$$$` or `$$$$` (four dollars) — an escape typo.
+    assert "$$" not in rendered, "raw $$ leaked to rendered output (missed a substitution)"
 
 
 def test_fsx_consumer_template_renders_with_expected_subs() -> None:
@@ -899,10 +984,13 @@ def test_fsx_vpc_endpoint_gated_on_enable_fsx() -> None:
     """The FSx interface VPC endpoint MUST exist and be gated on enable_fsx.
 
     On the endpoints-only VPC posture (var.enable_nat_gateway=false, the default),
-    private subnets have NO internet route. The hydrator's `aws fsx create-data-
-    repository-task` call would hang against fsx.<region>.amazonaws.com until the
-    Job's activeDeadlineSeconds fires — a silent DoS on the entire hydration path.
-    JGuinegagne blocking-reliability finding on d7cfd9c.
+    private subnets have NO internet route. The FSx CSI controller's Describe calls
+    (see the fsx_csi role in platform_fsx.tf) would hang against
+    fsx.<region>.amazonaws.com and PVC binds would fail. JGuinegagne blocking-
+    reliability finding on d7cfd9c (originally scoped to the hydration DRT path,
+    which has since moved to a KRO-managed track-deploy-time Job that does not
+    call the FSx API; the CSI controller need is what keeps this endpoint load-
+    bearing).
 
     The endpoint MUST use `private_dns_enabled = true` so the AWS SDK resolves
     fsx.<region>.amazonaws.com to the endpoint transparently (no client tuning).
@@ -1030,119 +1118,6 @@ def test_fsx_pv_has_az_node_affinity() -> None:
     storage = _resource((ENGINE / "platform_storage.tf").read_text(), "helm_release", "storage")
     assert '"fsx.availabilityZone"' in storage, (
         "helm_release.storage must set fsx.availabilityZone (from data.aws_subnet.fsx[0].availability_zone)"
-    )
-
-
-def test_fsx_hydration_job_is_gated_and_scoped() -> None:
-    """Hydration Job MUST be gated on both enable_fsx AND non-empty fsx_hydrate_prefixes
-    (an FSx-enabled cluster with no prefixes is a valid opt-in shape — don't ship a
-    Job that runs for no reason). Job spec MUST AZ-pin to the FSx AZ, tolerate the
-    system MNG taint, and mount the platform's model-store-fsx PVC.
-    """
-    content = (ENGINE / "platform_fsx_hydrate.tf").read_text()
-
-    # Every resource / module / data block MUST be gated on the combined
-    # enable_fsx && len(prefixes)>0 sentinel (local.fsx_hydrate_enabled).
-    declared = re.findall(
-        r'^(?:resource|module|data)\s+"[^"]+"\s+"([^"]+)"\s*\{',
-        content,
-        re.MULTILINE,
-    )
-    assert declared, "platform_fsx_hydrate.tf must declare at least one resource"
-    for name in declared:
-        pattern = rf'(?:resource|module|data)\s+"[^"]+"\s+"{re.escape(name)}"\s*\{{'
-        start = re.search(pattern, content)
-        assert start is not None
-        depth, idx = 1, start.end()
-        while idx < len(content) and depth > 0:
-            depth += {"{": 1, "}": -1}.get(content[idx], 0)
-            idx += 1
-        body = content[start.end() : idx - 1]
-        # for_each on the prefix map counts as gated (empty map → zero resources).
-        gated = re.search(r"count\s*=\s*local\.fsx_hydrate_enabled\s*\?\s*1\s*:\s*0", body) or (
-            "for_each = local.fsx_hydrate_prefix_slugs" in body.replace("  ", " ")
-        )
-        assert gated, (
-            f"platform_fsx_hydrate.tf resource/module/data '{name}' missing the "
-            f"local.fsx_hydrate_enabled gate OR for_each on fsx_hydrate_prefix_slugs"
-        )
-
-    # The Job MUST AZ-pin to the FSx AZ.
-    assert "topology.kubernetes.io/zone" in content, "hydration Job must nodeAffinity-pin to the FSx AZ"
-    assert "data.aws_subnet.fsx[0].availability_zone" in content, (
-        "hydration Job AZ value must come from the same source of truth as the FS "
-        "(data.aws_subnet.fsx[0].availability_zone)"
-    )
-    # And it MUST mount the platform's own model-store-fsx PVC.
-    assert 'claim_name = "model-store-fsx"' in content, (
-        "hydration Job must mount the platform-owned model-store-fsx PVC (not a per-track one)"
-    )
-    # ttl + activeDeadline present.
-    assert "ttl_seconds_after_finished" in content, "hydration Job must set ttl_seconds_after_finished"
-    assert "active_deadline_seconds" in content, "hydration Job must set active_deadline_seconds"
-
-
-def test_fsx_hydrator_iam_is_scoped_to_our_fs() -> None:
-    """The fsx_hydrator IAM policy MUST split DRT actions into two statements so that
-    Cancel/Describe are scoped per-deployment (not just Create). Roborev Medium on
-    d7cfd9c: single-statement version granted Cancel on `task/*` with no condition,
-    letting a compromised pod in deployment A cancel B's in-flight DRTs (cross-
-    deployment DoS on the exact 'two clusters in one account' case the design
-    claims to defend).
-
-    Contract:
-      - Create + TagResource on OUR file system's ARN (Create is where the DRT's
-        tags are set — DeploymentId lands then).
-      - Describe/Cancel on task/* WITH `aws:ResourceTag/DeploymentId` = our
-        random_id.postfix.hex — the tag on the DRT is what scopes ops per-deployment.
-      - S3 PutObject on the DEDICATED reports bucket (not the model_store weights
-        bucket — JGuinegagne blocking-security finding).
-      - NO `s3:PutObjectAcl` grant (inert under the bucket's BlockPublicAcls).
-    """
-    content = (ENGINE / "platform_fsx_hydrate.tf").read_text()
-    doc = _extract_block(content, "data", "aws_iam_policy_document", "fsx_hydrator")
-
-    # The two DRT statements exist by sid, not one combined statement.
-    assert "DrtCreateOnOurFileSystem" in doc, (
-        "fsx_hydrator must split DRT into a Create-on-our-FS statement (sid=DrtCreateOnOurFileSystem)"
-    )
-    assert "DrtOpsOnOurTasksOnly" in doc, (
-        "fsx_hydrator must split DRT into a task-ops statement (sid=DrtOpsOnOurTasksOnly) so "
-        "Cancel/Describe scope by ResourceTag, not just resource ARN"
-    )
-
-    # Create + TagResource on our FS ARN, NOT on task/*.
-    assert "aws_fsx_lustre_file_system.shared[0].arn" in doc, (
-        "fsx_hydrator Create statement must resource-scope to our FS ARN"
-    )
-
-    # All DRT actions granted somewhere in the doc.
-    for action in ("fsx:CreateDataRepositoryTask", "fsx:DescribeDataRepositoryTasks", "fsx:CancelDataRepositoryTask"):
-        assert action in doc, f"fsx_hydrator must grant {action}"
-
-    # Ops statement uses the ResourceTag/DeploymentId condition — this is the
-    # single load-bearing guard against cross-deployment cancel.
-    assert re.search(r"aws:ResourceTag/DeploymentId", doc), (
-        "fsx_hydrator Describe/Cancel MUST be conditioned on aws:ResourceTag/DeploymentId "
-        "— without it, a compromised pod can Cancel any DRT in the account"
-    )
-    assert "random_id.postfix.hex" in doc, (
-        "the DeploymentId tag value must be random_id.postfix.hex (this deployment's id)"
-    )
-
-    # Reports bucket must be the dedicated one, not model_store.
-    assert "module.fsx_drt_reports[0].bucket_arn" in doc, (
-        "DRT reports must land in the dedicated fsx_drt_reports bucket, not model_store"
-    )
-    assert "module.model_store.bucket_arn" not in doc, (
-        "fsx_hydrator MUST NOT reference model_store bucket — DRT reports belong in the "
-        "dedicated fsx_drt_reports bucket"
-    )
-
-    # s3:PutObjectAcl is inert under BlockPublicAcls, and dropping it minimizes the
-    # allow-list.
-    assert "s3:PutObjectAcl" not in doc, (
-        "s3:PutObjectAcl is inert under the bucket's BlockPublicAcls and must be dropped"
     )
 
 

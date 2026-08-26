@@ -1,0 +1,75 @@
+# Short-lived probe pod for the hydration end-to-end. Amazonlinux (Lustre client
+# available via dnf) mounts the same platform FSx PVC as the hydration Job and
+# checks two things:
+#   1. The `.hydrated-<slug>` sentinel exists in /models (the file workload
+#      initContainers gate on).
+#   2. `lfs hsm_state` on the file the test seeded to S3 does NOT report
+#      "released" — proving the Job actually pulled bytes onto Lustre OSTs
+#      rather than just refreshing metadata.
+#
+# Uses restartPolicy: Never so `wait --for=jsonpath={.status.phase}=Succeeded`
+# resolves cleanly on completion. Pinned to the FSx AZ (single-AZ FS).
+#
+# Substitutions (apply_resource → string.Template):
+#   ${pod}           — pod name (unique per run to avoid stale-object races)
+#   ${namespace}     — workload namespace
+#   ${image}         — amazonlinux via ECR pull-through (has lustre2.15-client)
+#   ${zone}          — FSx AZ (from Terraform output fsx_availability_zone)
+#   ${claim_name}    — FSx PVC name (model-store-fsx)
+#   ${sentinel_path} — /models/.hydrated-<slug> (test-computed)
+#   ${seed_path}     — /models/<prefix>/data.bin (test-seeded object path)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  namespace: ${namespace}
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: ["${zone}"]
+  containers:
+    - name: probe
+      image: ${image}
+      command: ["/bin/bash", "-c"]
+      # No unescaped `$$var` — every `$$` renders to a literal shell dollar via
+      # python string.Template; string.Template rejects unknown $${...} at render.
+      args:
+        - |
+          set -euo pipefail
+
+          # We need the Lustre client for `lfs hsm_state`. The mount itself is
+          # handed to us by the FSx CSI plugin (no client-install needed to see
+          # files) — but hsm_state is a Lustre-userspace tool.
+          dnf install -y --quiet lustre2.15-client >/dev/null
+
+          echo "[probe] sentinel check: ${sentinel_path}"
+          if [ ! -f "${sentinel_path}" ]; then
+            echo "[probe] FAIL: sentinel ${sentinel_path} missing" >&2
+            ls -la /models/ 2>&1 || true
+            exit 1
+          fi
+          echo "[probe] sentinel OK"
+
+          echo "[probe] hsm_state check: ${seed_path}"
+          state=$$(lfs hsm_state "${seed_path}" 2>&1 || true)
+          echo "[probe] hsm_state: $$state"
+          case "$$state" in
+            *released*)
+              echo "[probe] FAIL: seeded file is still 'released' — hsm_restore didn't warm bytes onto OSTs" >&2
+              exit 1
+              ;;
+          esac
+          echo "[probe] hsm_state OK"
+      volumeMounts:
+        - name: models
+          mountPath: /models
+  volumes:
+    - name: models
+      persistentVolumeClaim:
+        claimName: ${claim_name}

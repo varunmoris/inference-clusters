@@ -268,6 +268,10 @@ resource "helm_release" "storage" {
       { name = "fsx.availabilityZone", value = data.aws_subnet.fsx[0].availability_zone },
       { name = "fsx.capacity", value = "${var.fsx_storage_capacity_gib}Gi" },
       { name = "fsx.claimNamespace", value = kubernetes_namespace_v1.workload.metadata[0].name },
+      # AL2023 (dnf ships lustre2.15-client) via ECR pull-through — the
+      # endpoints-only VPC can't reach public.ecr.aws directly. The FsxHydrate
+      # RGD (charts/storage/templates/fsx-hydrate-rgd.yaml) uses this image.
+      { name = "fsx.hydrator.image", value = "${local.ecr_registry}/ecr-public/amazonlinux/amazonlinux:2023" },
     ] : [],
   )
 
@@ -277,6 +281,11 @@ resource "helm_release" "storage" {
     module.node_group,
     helm_release.fsx_csi_driver,
     aws_fsx_data_repository_association.models,
+    # fsx-hydrate-rgd.yaml declares a kro.run/v1alpha1/ResourceGraphDefinition;
+    # the CRD ships with the KRO controller release and must be present before
+    # helm renders the chart. Always-on dependency (KRO is unconditional), but
+    # only actually applied when enable_fsx=true.
+    helm_release.kro,
   ]
 }
 

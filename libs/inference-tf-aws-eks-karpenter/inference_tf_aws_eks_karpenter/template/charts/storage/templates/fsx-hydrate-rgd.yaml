@@ -1,0 +1,175 @@
+{{- /*
+FSx-for-Lustre byte-hydration primitive (KRO ResourceGraphDefinition).
+
+Ships a `FsxHydrate` kind so a track composes hydration into its own KRO graph
+next to the workload it wants pre-warmed. Applied at TRACK-DEPLOY time (post
+onboarder — when the weights are actually in S3), not at `jd up` time.
+
+A `FsxHydrate` CR expands to one Job that:
+  1. Installs the Lustre client (lustre2.15-client) and asserts /mnt/models is
+     lustre.
+  2. `lfs setstripe -c -1 -S 4M` on the prefix subtree so files land striped
+     across every OST (parallel-read on future first-touch too).
+  3. `find | xargs -P 32 lfs hsm_restore` fan-out to pull object bytes off S3
+     onto Lustre OSTs.
+  4. Polls `lfs hsm_state` until nothing is "released", then touches
+     `.hydrated-<slug>` in the mount root so workload initContainers can gate
+     on it (SLUG = prefix with `/` and `_` replaced by `-`).
+
+DRA `auto_import_policy = ["NEW","CHANGED"]` handles metadata sync from S3, so
+the Job does NOT need any AWS API access — no ServiceAccount role, no Pod
+Identity, no DRT. Data motion is pure Lustre client talking to the FSx SG.
+
+Gated on `.Values.fsx.enabled` because the RGD only makes sense on FSx
+clusters (the pod mounts the FSx PVC).
+*/ -}}
+{{- if .Values.fsx.enabled }}
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: fsx-hydrate
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: FsxHydrate
+    spec:
+      # S3-relative prefix under `models/` — matches the Lustre path.
+      # e.g. "qwen2.5-7b" hydrates s3://<model-store>/models/qwen2.5-7b/
+      # and produces sentinel /mnt/models/.hydrated-qwen2-5-7b.
+      prefix: string | required=true
+    status:
+      succeeded: ${job.status.succeeded}
+      failed: ${job.status.failed}
+  resources:
+    - id: job
+      template:
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: fsx-hydrate-${schema.metadata.name}
+          labels:
+            app.kubernetes.io/name: fsx-hydrate
+            app.kubernetes.io/component: hydration
+            app.kubernetes.io/managed-by: kro
+        spec:
+          backoffLimit: 3
+          # 2h ceiling — long enough for a full multi-GB prefix hsm_restore,
+          # short enough that a stuck FSx-S3 link (rate limit, misconfigured
+          # bucket policy) doesn't burn a Job indefinitely.
+          activeDeadlineSeconds: 7200
+          # 24h reap window — keep for postmortem, then GC.
+          ttlSecondsAfterFinished: 86400
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: fsx-hydrate
+                app.kubernetes.io/component: hydration
+            spec:
+              restartPolicy: OnFailure
+              # AZ-pin to the FSx AZ. Cross-AZ metadata polling for the
+              # hsm_state loop is a real per-op latency tax we don't need to
+              # eat on hydration.
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: topology.kubernetes.io/zone
+                            operator: In
+                            values:
+                              - {{ .Values.fsx.availabilityZone | quote }}
+              # Tolerate the system MNG taint so the Job can land on the
+              # always-on system node if one is in the FSx AZ; otherwise
+              # Karpenter provisions a small CPU node in that AZ.
+              tolerations:
+                - key: inference/role
+                  operator: Equal
+                  value: system
+                  effect: NoSchedule
+              volumes:
+                - name: models
+                  persistentVolumeClaim:
+                    claimName: {{ .Values.fsx.claimName | quote }}
+              containers:
+                - name: hydrator
+                  image: {{ .Values.fsx.hydrator.image | quote }}
+                  env:
+                    - name: PREFIX
+                      value: ${schema.spec.prefix}
+                  # Script is bash. `command` overrides the image's entrypoint;
+                  # args carries the -c payload. Env-var interpolation (not YAML
+                  # interpolation) is what feeds PREFIX into the script — KRO
+                  # substitutes the CR's spec.prefix into the env value, then
+                  # the shell reads it back as "$PREFIX" (quoted expansion, no
+                  # word-splitting).
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+
+                      echo "[hydrate] install lustre-client"
+                      dnf install -y --quiet lustre2.15-client findutils >/dev/null
+
+                      echo "[hydrate] verify /mnt/models is lustre"
+                      mount | awk '$3 == "/mnt/models" && $5 == "lustre" { found=1 } END { exit !found }' \
+                        || { echo "[hydrate] FAIL: /mnt/models is not lustre"; mount; exit 1; }
+
+                      # Slug: strip characters not valid in a POSIX filename we
+                      # want workload initContainers to gate on. /-and-_ → -.
+                      SLUG=$(printf %s "$PREFIX" | tr '/_' '--')
+
+                      # 1. Stripe across every OST so future writes/reads under
+                      #    the prefix parallelize (setstripe applies to a dir;
+                      #    inherited by new files created inside).
+                      if [ -d "/mnt/models/$PREFIX" ]; then
+                        echo "[hydrate] lfs setstripe /mnt/models/$PREFIX"
+                        lfs setstripe -c -1 -S 4M "/mnt/models/$PREFIX" || echo "[hydrate] setstripe warning (non-fatal)"
+                      else
+                        # DRA auto_import is async; the prefix may not have
+                        # surfaced in Lustre yet. Wait up to 5 min for the
+                        # namespace-import event; give up after that.
+                        echo "[hydrate] awaiting DRA import of /mnt/models/$PREFIX (auto_import is async)"
+                        WAIT_DEADLINE=$(( $(date +%s) + 300 ))
+                        until [ -d "/mnt/models/$PREFIX" ]; do
+                          [ "$(date +%s)" -ge "$WAIT_DEADLINE" ] && { echo "[hydrate] FAIL: /mnt/models/$PREFIX never appeared"; exit 1; }
+                          sleep 10
+                        done
+                        lfs setstripe -c -1 -S 4M "/mnt/models/$PREFIX" || echo "[hydrate] setstripe warning (non-fatal)"
+                      fi
+
+                      # 2. Fan out hsm_restore across the tree.
+                      echo "[hydrate] hsm_restore fan-out (P=32)"
+                      find "/mnt/models/$PREFIX" -type f -print0 \
+                        | xargs -0 -r -P 32 -n 32 lfs hsm_restore 2>/dev/null || true
+
+                      # 3. Poll until every file is EXISTS (not released).
+                      #    Inner deadline is a soft cap; activeDeadlineSeconds
+                      #    is the hard kill at the K8s layer.
+                      echo "[hydrate] awaiting hsm_state != released"
+                      DEADLINE=$(( $(date +%s) + 5400 ))
+                      while :; do
+                        PENDING=$(find "/mnt/models/$PREFIX" -type f -print0 \
+                          | xargs -0 -r -n 64 lfs hsm_state 2>/dev/null \
+                          | grep -c "released" || true)
+                        [ "$PENDING" -eq 0 ] && break
+                        echo "[hydrate] $PENDING files still released — waiting"
+                        [ "$(date +%s)" -ge "$DEADLINE" ] && \
+                          { echo "[hydrate] soft timeout — $PENDING files still released"; exit 1; }
+                        sleep 30
+                      done
+
+                      # 4. Sentinel — workload initContainers gate on this file existing.
+                      touch "/mnt/models/.hydrated-$SLUG"
+                      echo "[hydrate] OK — .hydrated-$SLUG"
+                  resources:
+                    requests:
+                      cpu: "500m"
+                      memory: 512Mi
+                    # No CPU limit — lfs is subject to LNet timeouts under CPU
+                    # throttling. Memory cap only.
+                    limits:
+                      memory: 2Gi
+                  volumeMounts:
+                    - name: models
+                      mountPath: /mnt/models
+{{- end }}

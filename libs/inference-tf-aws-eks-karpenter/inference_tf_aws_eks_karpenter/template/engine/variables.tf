@@ -612,29 +612,6 @@ variable "fsx_csi_driver_chart_version" {
   type        = string
 }
 
-variable "fsx_hydrate_prefixes" {
-  description = <<-EOT
-    S3-subpath list to bulk-warm from S3 into Lustre disk at deploy time.
-
-    FSx DRA imports S3 object METADATA (namespace) at creation, but file BYTES are
-    lazy-loaded on first read — the first pod eats the S3-to-Lustre download tax
-    per file, killing deterministic cold-start. Setting a prefix here launches a
-    platform-owned Kubernetes Job that pre-fetches every file under the prefix via
-    `find | xargs -P 32 lfs hsm_restore`, then stripes the tree with `lfs setstripe
-    -c -1 -S 4M` for parallel-read on all OSTs, then writes a `.hydrated-<slug>`
-    sentinel that workload initContainers can gate on.
-
-    Paths are RELATIVE to the FSx mount root /models — e.g. ["qwen2.5-7b",
-    "llama-3-70b"] hydrates s3://<model-store>/models/qwen2.5-7b/ and .../llama-3-70b/.
-
-    Empty list = skip hydration entirely (still opt-in inside enable_fsx=true).
-    Prefixes must be non-empty subpaths — hydrating the whole "/models" tree in
-    one Job over-fetches every model the onboarder ever pushed.
-
-    Recommended: []
-  EOT
-  type        = list(string)
-}
 variable "gpu_parallel_image_pull" {
   description = <<-EOT
     Whether to enable the SOCI snapshotter (parallel pull/unpack) on GPU nodes.

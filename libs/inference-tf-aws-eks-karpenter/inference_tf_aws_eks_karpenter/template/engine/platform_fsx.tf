@@ -179,9 +179,9 @@ resource "aws_cloudwatch_log_group" "fsx" {
 # --- FSx interface VPC endpoint (endpoints-only VPC posture) ---
 #
 # On the default endpoints-only posture (var.enable_nat_gateway = false) the private
-# subnets have NO route to the internet. The hydrator's `aws fsx create-data-repository-task`
-# call then hangs against fsx.<region>.amazonaws.com until the Job's activeDeadlineSeconds
-# fires — the JGuinegagne blocking-reliability finding on d7cfd9c. Add the FSx interface
+# subnets have NO route to the internet. The FSx CSI controller's `fsx:DescribeFileSystems`
+# / `fsx:DescribeDataRepositoryAssociations` calls (see fsx_csi role above) would then
+# hang against fsx.<region>.amazonaws.com and PVC binds would fail. Add the FSx interface
 # endpoint co-located with the rest of the platform's interface endpoints (see
 # modules/vpc/main.tf `interface_endpoints`), gated on `enable_fsx` so the ~$14/mo cost
 # floor only lands on FSx-enabled clusters. private_dns_enabled = true so the AWS SDK

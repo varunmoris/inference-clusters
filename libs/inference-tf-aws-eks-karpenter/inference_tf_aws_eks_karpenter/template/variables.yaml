@@ -32,4 +32,3 @@ overrides:
   # fsx_imported_file_chunk_size_mib: 16
   # fsx_kms_key_arn: ""
   # fsx_csi_driver_chart_version: "1.17.0"
-  # fsx_hydrate_prefixes: []               # e.g. ["qwen2.5-7b", "llama-3-70b"]
