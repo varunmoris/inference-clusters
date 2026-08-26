@@ -893,6 +893,20 @@ def test_fsx_hydrate_rgd_shape() -> None:
     assert "lfs hsm_restore" in tmpl, "hydration script must fan out lfs hsm_restore on the prefix"
     assert re.search(r"touch\s+.*hydrated-", tmpl), "hydration script must touch the .hydrated-<slug> sentinel"
 
+    # The `released`-state polling loop MUST strip the path before matching, or
+    # it false-matches on filenames like `released-v2/…` and never lets PENDING
+    # reach 0 — the Job then exits 1 after its inner soft deadline (5400s) and
+    # hydration silently fails for every prefix containing "released" as a
+    # substring in any path (roborev 532f0d3 Medium). Anchor the fix here: a
+    # naive `grep -c "released"` on raw `lfs hsm_state` output is a regression.
+    hsm_state_block = re.search(r"lfs hsm_state.*?done", tmpl, re.DOTALL)
+    assert hsm_state_block is not None, "hydration script must contain an hsm_state polling loop"
+    hsm_state_block_text = hsm_state_block.group(0)
+    assert re.search(r"sed\s+.*\)\s*//", hsm_state_block_text) or "awk" in hsm_state_block_text, (
+        "hsm_state polling loop must strip the file path (sed/awk) before matching `released` — "
+        "a bare `grep released` false-matches filenames like `released-v2/...` and hangs the Job"
+    )
+
     # Safety caps — matches the equivalent settings on any TF-side Job.
     assert "activeDeadlineSeconds" in tmpl, "Job must set activeDeadlineSeconds (hard kill for stuck restores)"
     assert "ttlSecondsAfterFinished" in tmpl, "Job must set ttlSecondsAfterFinished (postmortem-then-reap)"

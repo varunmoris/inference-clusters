@@ -145,11 +145,21 @@ spec:
                       # 3. Poll until every file is EXISTS (not released).
                       #    Inner deadline is a soft cap; activeDeadlineSeconds
                       #    is the hard kill at the K8s layer.
+                      #
+                      #    `lfs hsm_state` prints one line per file:
+                      #      <path>: (0xHEX) [flag1 flag2 ...][, archive_id:N]
+                      #    The `released` state flag appears in the flags list,
+                      #    NOT the path — but a naive `grep released` would also
+                      #    match a filename like `released-v2/...` and never let
+                      #    PENDING reach 0 (roborev 532f0d3 Medium). Strip the
+                      #    path prefix via sed before grep so the match is bound
+                      #    to the flags portion only.
                       echo "[hydrate] awaiting hsm_state != released"
                       DEADLINE=$(( $(date +%s) + 5400 ))
                       while :; do
                         PENDING=$(find "/mnt/models/$PREFIX" -type f -print0 \
                           | xargs -0 -r -n 64 lfs hsm_state 2>/dev/null \
+                          | sed -E 's/^[^:]+: \(0x[0-9a-fA-F]+\) //' \
                           | grep -c "released" || true)
                         [ "$PENDING" -eq 0 ] && break
                         echo "[hydrate] $PENDING files still released — waiting"
