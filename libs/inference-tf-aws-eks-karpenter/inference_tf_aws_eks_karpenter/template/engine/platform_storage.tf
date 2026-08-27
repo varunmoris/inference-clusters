@@ -268,10 +268,6 @@ resource "helm_release" "storage" {
       { name = "fsx.availabilityZone", value = data.aws_subnet.fsx[0].availability_zone },
       { name = "fsx.capacity", value = "${var.fsx_storage_capacity_gib}Gi" },
       { name = "fsx.claimNamespace", value = kubernetes_namespace_v1.workload.metadata[0].name },
-      # busybox via ECR pull-through. The hydrator only needs sh + coreutils
-      # (find/xargs/cat/awk/tr/printf); amazonlinux:2023 is too minimal (no
-      # mount, no findutils) and installing extras cross-region-safely is a
-      # trap on the endpoints-only VPC.
       { name = "fsx.hydrator.image", value = "${local.ecr_registry}/ecr-public/docker/library/busybox:1.36" },
     ] : [],
   )
