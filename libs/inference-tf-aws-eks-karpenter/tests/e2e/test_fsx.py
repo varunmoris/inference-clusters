@@ -395,6 +395,53 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
     seed_body = b"x" * 4096
     sentinel_path = f"/models/.hydrated-{slug}"
 
+    def _dump_hydrate_diagnostics(reason: str) -> str:
+        """kubectl-describe + kubectl-logs + recent events for the Job and any pod
+        it produced. Called on wait-timeout so the pytest failure captures WHY the
+        Job didn't Complete (dnf install failure, image pull error, Karpenter
+        starvation) rather than just "wait timed out". Returned as a single string
+        the AssertionError body embeds; nothing is asserted against it here."""
+        parts = [f"[hydrate-diag] {reason}"]
+        # Job describe: shows retry count, active/failed pods, condition/events.
+        parts.append(
+            "--- kubectl describe job ---\n"
+            + run_kubectl("describe", "job", job_name, "-n", workload_ns, check=False).stdout
+        )
+        # Every pod the Job ever produced (including CrashLoopBackOff retries).
+        pods = run_kubectl(
+            "get",
+            "pods",
+            "-n",
+            workload_ns,
+            "-l",
+            f"batch.kubernetes.io/job-name={job_name}",
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+            check=False,
+        ).stdout.split()
+        for p in pods or []:
+            parts.append(
+                f"--- kubectl describe pod {p} ---\n"
+                + run_kubectl("describe", "pod", p, "-n", workload_ns, check=False).stdout
+            )
+            parts.append(
+                f"--- kubectl logs {p} (previous + current, tail) ---\n"
+                + run_kubectl("logs", p, "-n", workload_ns, "--previous", "--tail=200", check=False).stdout
+                + "\n---\n"
+                + run_kubectl("logs", p, "-n", workload_ns, "--tail=200", check=False).stdout
+            )
+        # Recent namespace events — image pull failures, PVC bind stalls, etc.
+        parts.append(
+            "--- kubectl get events (last 30) ---\n"
+            + run_kubectl("get", "events", "-n", workload_ns, "--sort-by=.lastTimestamp", check=False).stdout[-4000:]
+        )
+        # RGD status — did KRO reconcile the CR?
+        parts.append(
+            "--- kubectl get resourcegraphdefinition/fsx-hydrate -o yaml ---\n"
+            + run_kubectl("get", "resourcegraphdefinition/fsx-hydrate", "-o", "yaml", check=False).stdout
+        )
+        return "\n\n".join(parts)
+
     h.s3_put_object(model_store, seed_key, seed_body)
     try:
         # 3. Apply the CR — KRO reconciles it into a Job.
@@ -409,17 +456,24 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
         #    provision a CPU node in the FSx AZ (2-3 min), FSx CSI attaches the
         #    Lustre client (30-60s), the pod dnf-installs lustre2.15-client
         #    (~30s), then hsm_restore + hsm_state polling on a 4 KiB file
-        #    finishes in seconds. 10-min ceiling is generous but keeps a stuck
+        #    finishes in seconds. 15-min ceiling is generous but keeps a stuck
         #    Job from wedging the mutating suite.
-        run_kubectl(
-            "wait",
-            "--for=condition=Complete",
-            f"job/{job_name}",
-            "-n",
-            workload_ns,
-            "--timeout=600s",
-            check=True,
-        )
+        try:
+            run_kubectl(
+                "wait",
+                "--for=condition=Complete",
+                f"job/{job_name}",
+                "-n",
+                workload_ns,
+                "--timeout=900s",
+                check=True,
+            )
+        except Exception as e:
+            raise AssertionError(
+                f"hydration Job {job_name} did not reach condition=Complete within 15m.\n"
+                f"{_dump_hydrate_diagnostics('Job wait timeout')}\n"
+                f"original error: {e}"
+            ) from e
 
         # Confirm the Job landed on the FSx AZ (defence against a stale
         # affinity block — a wrong-AZ node would still schedule but every mount
@@ -468,15 +522,24 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
             seed_path=f"/models/{prefix}/data.bin",
         )
         try:
-            run_kubectl(
-                "wait",
-                "--for=jsonpath={.status.phase}=Succeeded",
-                f"pod/{probe_pod}",
-                "-n",
-                workload_ns,
-                "--timeout=300s",
-                check=True,
-            )
+            try:
+                run_kubectl(
+                    "wait",
+                    "--for=jsonpath={.status.phase}=Succeeded",
+                    f"pod/{probe_pod}",
+                    "-n",
+                    workload_ns,
+                    "--timeout=300s",
+                    check=True,
+                )
+            except Exception as e:
+                describe = run_kubectl("describe", "pod", probe_pod, "-n", workload_ns, check=False).stdout
+                logs = run_kubectl("logs", probe_pod, "-n", workload_ns, "--tail=200", check=False).stdout
+                raise AssertionError(
+                    f"probe pod {probe_pod} did not reach Succeeded within 5m.\n"
+                    f"--- describe ---\n{describe}\n--- logs ---\n{logs}\n"
+                    f"original error: {e}"
+                ) from e
             logs = run_kubectl("logs", probe_pod, "-n", workload_ns, check=True).stdout
             assert "[probe] sentinel OK" in logs, (
                 f"probe pod completed but sentinel {sentinel_path} was missing; logs:\n{logs[-2000:]}"
