@@ -67,7 +67,7 @@ spec:
                   env:
                     - name: PREFIX
                       value: ${schema.spec.prefix}
-                  command: ["/bin/bash", "-c"]
+                  command: ["sh", "-c"]
                   args:
                     - |
                       set -euo pipefail
@@ -75,8 +75,8 @@ spec:
                       # Reject `..` so the sentinel-touch can't escape /mnt/models.
                       case "$PREFIX" in *..*|"") echo "[hydrate] FAIL: invalid PREFIX"; exit 1 ;; esac
 
-                      mount | awk '$3 == "/mnt/models" && $5 == "lustre" { found=1 } END { exit !found }' \
-                        || { echo "[hydrate] FAIL: /mnt/models is not lustre"; mount; exit 1; }
+                      awk '$2 == "/mnt/models" && $3 == "lustre" { found=1 } END { exit !found }' /proc/mounts \
+                        || { echo "[hydrate] FAIL: /mnt/models is not lustre"; cat /proc/mounts; exit 1; }
 
                       SLUG=$(printf %s "$PREFIX" | tr '/' '-')
 
