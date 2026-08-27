@@ -1,0 +1,8 @@
+# FsxHydrate CR for the hydration e2e.
+apiVersion: kro.run/v1alpha1
+kind: FsxHydrate
+metadata:
+  name: ${cr_name}
+  namespace: ${namespace}
+spec:
+  prefix: ${prefix}

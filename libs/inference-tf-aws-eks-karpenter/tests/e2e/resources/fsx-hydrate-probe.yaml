@@ -1,0 +1,37 @@
+# Probe pod for the hydration e2e — asserts the sentinel exists.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  namespace: ${namespace}
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: ["${zone}"]
+  containers:
+    - name: probe
+      image: ${image}
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -eu
+
+          if [ ! -f "${sentinel_path}" ]; then
+            echo "[probe] FAIL: sentinel ${sentinel_path} missing" >&2
+            ls -la /models/ 2>&1 || true
+            exit 1
+          fi
+          echo "[probe] sentinel OK"
+      volumeMounts:
+        - name: models
+          mountPath: /models
+  volumes:
+    - name: models
+      persistentVolumeClaim:
+        claimName: ${claim_name}

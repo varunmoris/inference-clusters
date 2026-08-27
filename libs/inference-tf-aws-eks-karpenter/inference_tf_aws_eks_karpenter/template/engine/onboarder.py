@@ -179,6 +179,37 @@ def split_image_ref(ref: str) -> tuple[str, str, str | None]:
     return "", name, tag
 
 
+def _looks_like_image_ref(s: str) -> bool:
+    """True if `s` is shaped like a container image ref: an `@sha256:` digest,
+    or a multi-segment path with a `:tag` after the last `/`. Weight-source
+    URIs (s3://, hf://), bare paths (models/foo), and colon-bearing non-image
+    scalars (2:09:00, host:8080) are all excluded."""
+    if " " in s or "\n" in s or "://" in s:
+        return False
+    if "@sha256:" in s:
+        return True
+    if "/" not in s:
+        return False
+    return ":" in s[s.rfind("/") :]
+
+
+def _find_stray_image_refs(obj: Any, seen: list[str] | None = None) -> list[str]:
+    """Walk a parsed YAML doc and return string values that look like image refs.
+    Used when values.yaml declares nothing to catch typo'd sidecars (`image:`
+    instead of `images:`) that would otherwise pass through un-rehosted."""
+    if seen is None:
+        seen = []
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _find_stray_image_refs(v, seen)
+    elif isinstance(obj, list):
+        for v in obj:
+            _find_stray_image_refs(v, seen)
+    elif isinstance(obj, str) and _looks_like_image_ref(obj):
+        seen.append(obj)
+    return seen
+
+
 def weight_name_from_source(source: str) -> str:
     """Derive the models/<name> leaf for a weight source: its last path segment.
 
@@ -758,8 +789,26 @@ class Onboarder:
         image_paths = sidecar.get("images") or []
         weight_paths = sidecar.get("weights") or []
         builds = sidecar.get("builds") or []
-        if not image_paths and not builds:
-            raise SystemExit("[onboard] ERROR: graph values.yaml has no images: or builds: field-paths to rehost")
+
+        # All three lists may be empty — a storage-only block (PV+PVC, no containers,
+        # no weights, no builds; e.g. blocks/model-store-fsx) has nothing to rehost
+        # and just gets its graph.yaml passed through as the emitted air-gapped copy
+        # so the deployer's single apply path still works. NOT an error condition.
+        #
+        # But: scan graph.yaml for stray registry-looking refs when nothing is
+        # declared — catches the typo case (`image:` instead of `images:`) that
+        # would otherwise pass through un-rehosted and only surface at deploy
+        # time as ErrImagePull on the endpoints-only VPC.
+        if not (image_paths or weight_paths or builds):
+            stray = _find_stray_image_refs(graph)
+            if stray:
+                raise SystemExit(
+                    "[onboard] ERROR: storage-only block declared (no images/weights/builds "
+                    f"in values.yaml) but graph.yaml contains image-like refs: {stray[:5]}. "
+                    "Add a values.yaml `images:`/`builds:` entry pointing at each, or remove "
+                    "the ref if the block truly is storage-only."
+                )
+            log("[onboard] WARN: values.yaml declares no images/weights/builds — emitting graph passthrough")
 
         if image_paths:
             log(f"rehosting images to {self.ecr}/{self.prefix}/*")

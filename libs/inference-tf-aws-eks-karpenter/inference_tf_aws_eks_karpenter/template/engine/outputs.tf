@@ -121,6 +121,11 @@ output "monitoring_namespace" {
   value       = local.monitoring_namespace
 }
 
+output "lws_namespace" {
+  description = "Namespace the LeaderWorkerSet controller runs in (health-check scope, only meaningful when enable_lws=true)."
+  value       = local.lws_namespace
+}
+
 # Vendored-image ECR repo names + shared tag — the health `images:` block resolves each
 # image's repository-output/tag-output from these to confirm the air-gapped vendoring
 # landed in ECR. Per-image string outputs (the jd images layer resolves one string each;
@@ -213,4 +218,44 @@ output "onboarder_output_s3_uri" {
 output "trusted_upstream_registries" {
   description = "No-credentials registry hosts a chart image may reference (resolved via ECR pull-through).."
   value       = sort([for u in local.trusted_upstreams : u.url])
+}
+
+# --- FSx for Lustre outputs (empty strings / null when var.enable_fsx is false) ---
+
+output "fsx_enabled" {
+  description = "Whether the FSx for Lustre shared file system is provisioned (\"true\"/\"false\")."
+  # tostring() so the value is a string, not a bool — jupyter-deploy's TF output-def
+  # parser (tf_outdefs.py) only classifies string / list[str] / number and raises
+  # NotImplementedError on `type: bool`, which fails `jd up`'s push-to-store step.
+  value = tostring(var.enable_fsx)
+}
+
+output "fsx_file_system_id" {
+  description = "ID of the shared FSx for Lustre file system (empty when disabled)."
+  value       = var.enable_fsx ? aws_fsx_lustre_file_system.shared[0].id : ""
+}
+
+output "fsx_file_system_arn" {
+  description = "ARN of the shared FSx for Lustre file system (empty when disabled)."
+  value       = var.enable_fsx ? aws_fsx_lustre_file_system.shared[0].arn : ""
+}
+
+output "fsx_dns_name" {
+  description = "DNS name of the shared FSx for Lustre file system (empty when disabled)."
+  value       = var.enable_fsx ? aws_fsx_lustre_file_system.shared[0].dns_name : ""
+}
+
+output "fsx_mount_name" {
+  description = "Lustre mount name for the shared file system — second half of the CSI volumeHandle (empty when disabled)."
+  value       = var.enable_fsx ? aws_fsx_lustre_file_system.shared[0].mount_name : ""
+}
+
+output "fsx_availability_zone" {
+  description = "AZ the FSx file system lives in — pin FSx-consumer pods here via topology.kubernetes.io/zone (empty when disabled)."
+  value       = var.enable_fsx ? data.aws_subnet.fsx[0].availability_zone : ""
+}
+
+output "fsx_data_repository_path" {
+  description = "S3 URI the /models mount is linked to via the DRA (empty when disabled)."
+  value       = var.enable_fsx ? aws_fsx_data_repository_association.models[0].data_repository_path : ""
 }

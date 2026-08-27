@@ -9,6 +9,7 @@ merely mirrors them is churn, not a guard. Parsing is regex + brace-matching (no
 """
 
 import re
+import string
 import subprocess
 
 import yaml
@@ -744,6 +745,520 @@ def test_node_launch_template_carries_mirror_userdata() -> None:
     tftpl = (ENGINE / "modules" / "node_group" / "userdata.sh.tftpl").read_text()
     assert "config_path" in tftpl and "certs.d" in tftpl, "userData must set containerd certs.d config_path"
     assert "node.eks.aws" in tftpl, "userData must be a nodeadm NodeConfig MIME part"
+
+
+# --- FSx for Lustre (opt-in) ---
+
+
+def test_fsx_resources_are_gated_on_enable_fsx() -> None:
+    """Every resource / module / data source declared in platform_fsx.tf MUST be gated by
+    `count = var.enable_fsx ? 1 : 0`.
+
+    FSx is opt-in — a PERSISTENT_2 SSD file system has a non-trivial hourly cost floor,
+    and it is single-AZ. A resource that leaks past the gate provisions Lustre on every
+    deployment (or fails plan on a fresh account with no SLR).
+    """
+    content = (ENGINE / "platform_fsx.tf").read_text()
+    # Every resource | module | data block in the file must be gated.
+    declared = re.findall(
+        r'^(?:resource|module|data)\s+"[^"]+"\s+"([^"]+)"\s*\{',
+        content,
+        re.MULTILINE,
+    )
+    assert declared, "no resources / modules / data sources declared in platform_fsx.tf"
+    for name in declared:
+        # Extract the matching block by its declaration line.
+        pattern = rf'(?:resource|module|data)\s+"[^"]+"\s+"{re.escape(name)}"\s*\{{'
+        block_start = re.search(pattern, content)
+        assert block_start is not None
+        depth, idx = 1, block_start.end()
+        while idx < len(content) and depth > 0:
+            depth += {"{": 1, "}": -1}.get(content[idx], 0)
+            idx += 1
+        block = content[block_start.end() : idx - 1]
+        assert re.search(r"count\s*=\s*var\.enable_fsx\s*\?\s*1\s*:\s*0", block), (
+            f"platform_fsx.tf resource/module/data '{name}' missing count = var.enable_fsx gate"
+        )
+
+
+def test_fsx_uses_persistent2_ssd_lz4_with_dra() -> None:
+    """The FSx file system MUST be PERSISTENT_2 SSD (DRA-capable) with LZ4 compression, and
+    MUST have a Data Repository Association pointed at the model-store bucket's models/ prefix
+    with auto-export off (S3 is source of truth; workloads never write to /models)."""
+    content = (ENGINE / "platform_fsx.tf").read_text()
+    fs = _resource(content, "aws_fsx_lustre_file_system", "shared")
+    assert 'deployment_type             = "PERSISTENT_2"' in fs or 'deployment_type = "PERSISTENT_2"' in fs.replace(
+        "  ", " "
+    ), "FSx must be PERSISTENT_2 (DRA-capable)"
+    assert 'storage_type                = "SSD"' in fs or 'storage_type = "SSD"' in fs.replace("  ", " ")
+    assert 'data_compression_type       = "LZ4"' in fs or 'data_compression_type = "LZ4"' in fs.replace("  ", " ")
+    # The FSx service-linked role MUST NOT be TF-managed: it is an account-global singleton;
+    # a `resource "aws_iam_service_linked_role" "fsx"` would collide across two coexisting
+    # FSx-enabled deployments in one account (second apply fails "role has been taken").
+    # FSx auto-creates it on the first CreateFileSystem call — a documented one-time race.
+    assert 'resource "aws_iam_service_linked_role"' not in content, (
+        "platform_fsx.tf must NOT declare aws_iam_service_linked_role — it's an account-global "
+        "singleton that breaks two-deployments-in-one-account coexistence"
+    )
+
+    dra = _resource(content, "aws_fsx_data_repository_association", "models")
+    assert "module.model_store.bucket_name" in dra, "DRA must point at the model_store bucket"
+    assert "local.model_store_models_prefix" in dra, "DRA must point at the shared models/ prefix"
+    assert "batch_import_meta_data_on_create = true" in dra, "DRA must index pre-existing objects on create"
+    # Auto-export MUST be empty (workloads never write to /models via Lustre); auto-import ON.
+    assert re.search(r"auto_export_policy\s*\{\s*events\s*=\s*\[\s*\]", dra), (
+        "auto_export_policy events must be empty (S3 is source of truth)"
+    )
+    assert re.search(r'auto_import_policy\s*\{\s*events\s*=\s*\[.*"NEW".*\]', dra, re.DOTALL), (
+        "auto_import_policy must include NEW events"
+    )
+    # DELETED events MUST NOT be in auto_import: an S3-side delete (lifecycle rule fire,
+    # compromised principal, misconfigured bucket policy) would otherwise propagate to
+    # Lustre within seconds and evict running workloads' weights with no undo path. Explicit
+    # resync via `terraform destroy` on the DRA + reapply is the only sanctioned path.
+    auto_import_match = re.search(r"auto_import_policy\s*\{\s*events\s*=\s*\[([^\]]*)\]", dra, re.DOTALL)
+    assert auto_import_match is not None, "auto_import_policy events list not found"
+    assert '"DELETED"' not in auto_import_match.group(1), (
+        "auto_import_policy MUST NOT include DELETED — S3-side deletes must not silently propagate to Lustre"
+    )
+
+    # imported_file_chunk_size MUST come from the tunable var, not a hardcoded value.
+    # 1024 (the AWS default) caps every S3 object <1 GiB on a single OST — no parallel-
+    # read across servers, tail-latency-bound throughput for exactly the tensor-file
+    # workload FSx is supposed to accelerate. 16 MiB (our new default) fans across OSTs.
+    assert "imported_file_chunk_size         = var.fsx_imported_file_chunk_size_mib" in dra or (
+        "var.fsx_imported_file_chunk_size_mib" in dra
+    ), "DRA imported_file_chunk_size must be var-driven, not a hardcoded 1024"
+
+    # file_system_path MUST be "/" (Lustre root ⇄ S3 models/ prefix). Any other value
+    # (notably "/models") double-nests the imported content — S3 `models/foo.bin` ends
+    # up at Lustre `/models/foo.bin` while the pod (which mounts Lustre root at
+    # /models) then sees it at `/models/models/foo.bin`. The hydration Job would then
+    # operate on a nonexistent Lustre subtree and silently no-op (roborev's High
+    # finding, tracked across every pre-fix commit).
+    assert re.search(r'file_system_path\s*=\s*"/"(?!\w)', dra), (
+        'DRA file_system_path MUST be "/" so Lustre root maps directly to the '
+        "S3 models/ prefix — the pod mounts Lustre root at /models, so S3 "
+        "models/foo.bin appears at pod /models/foo.bin (mirroring the S3-mount PV "
+        'layout). Any nested path (e.g. "/models") silently no-ops hydration.'
+    )
+
+
+def test_fsx_hydrate_rgd_shape() -> None:
+    """FsxHydrate RGD contract: FSx-gated KRO RGD renders a Job that mounts the
+    platform PVC on the FSx AZ, full-reads the prefix (built-in HSM restore),
+    and touches the sentinel — no `lfs` / no `dnf install`."""
+    tmpl_path = CHARTS / "storage" / "templates" / "fsx-hydrate-rgd.yaml"
+    assert tmpl_path.exists()
+    tmpl = tmpl_path.read_text()
+
+    assert "{{- if .Values.fsx.enabled }}" in tmpl
+    assert "kind: ResourceGraphDefinition" in tmpl
+    assert re.search(r"kind:\s*FsxHydrate", tmpl)
+    assert re.search(r"prefix:\s*string\s*\|\s*required=true", tmpl)
+    assert re.search(r"apiVersion:\s*batch/v1", tmpl) and "kind: Job" in tmpl
+    assert "{{ .Values.fsx.claimName" in tmpl
+    assert "{{ .Values.fsx.availabilityZone" in tmpl
+    assert "topology.kubernetes.io/zone" in tmpl
+    assert "cat" in tmpl and "/dev/null" in tmpl
+    assert re.search(r"touch\s+.*hydrated-", tmpl)
+    assert "activeDeadlineSeconds" in tmpl
+    assert "ttlSecondsAfterFinished" in tmpl
+
+    # Regression guard: pre-warm rides on the built-in HSM restore-on-read; a
+    # client install path (dnf/lustre-client repo) is a cross-region trap
+    # (fsx-lustre-client-repo is us-east-1-only via the S3 gateway endpoint).
+    for banned in ("dnf install", "lustre2.15-client", "fsx-lustre-client-repo", "kmod-lustre-client"):
+        assert banned not in tmpl, f"regression: hydration script must not contain {banned!r}"
+
+    storage = _resource((ENGINE / "platform_storage.tf").read_text(), "helm_release", "storage")
+    assert '"fsx.hydrator.image"' in storage
+    assert "ecr-public/amazonlinux/amazonlinux" in storage
+    assert "helm_release.kro" in storage, "storage release must depend on the KRO CRD"
+
+
+def test_fsx_hydrate_cr_template_renders_with_expected_subs() -> None:
+    """Guard against unescaped `$var` outside the expected placeholder set."""
+    resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-hydrate-cr.yaml").read_text()
+    subs = {
+        "namespace": "inference",
+        "cr_name": "hydrate-abc123",
+        "prefix": "hydrate-e2e-abc123",
+    }
+    rendered = string.Template(resource).substitute(**subs)
+    assert "hydrate-abc123" in rendered
+    assert "prefix: hydrate-e2e-abc123" in rendered
+
+
+def test_fsx_hydrate_probe_template_renders_with_expected_subs() -> None:
+    """Same guard for fsx-hydrate-probe.yaml."""
+    resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-hydrate-probe.yaml").read_text()
+    subs = {
+        "pod": "fsx-hydrate-probe-abc123",
+        "namespace": "inference",
+        "image": "1234.dkr.ecr.us-west-2.amazonaws.com/ecr-public/docker/library/busybox:1.36",
+        "zone": "us-west-2a",
+        "claim_name": "model-store-fsx",
+        "sentinel_path": "/models/.hydrated-hydrate-e2e-abc123",
+    }
+    rendered = string.Template(resource).substitute(**subs)
+    assert "fsx-hydrate-probe-abc123" in rendered
+    assert "/models/.hydrated-hydrate-e2e-abc123" in rendered
+    assert "$$" not in rendered, "raw $$ leaked to rendered output"
+
+
+def test_fsx_consumer_template_renders_with_expected_subs() -> None:
+    """apply_resource() feeds tests/e2e/resources/fsx-consumer.yaml through
+    string.Template.substitute() with a fixed set of placeholders. Every `$var` /
+    `${var}` in the template that is NOT one of those placeholders MUST be `$$var`
+    (shell literal) — otherwise the render raises KeyError at CI time (which is a
+    ~30-min feedback loop). This test catches the class of bug locally.
+    """
+    resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-consumer.yaml").read_text()
+    # Same kwargs test_fsx_consumer_pod_mounts_and_readwrites passes in.
+    subs = {
+        "image": "1234.dkr.ecr.us-west-2.amazonaws.com/ecr-public/docker/library/busybox:1.36",
+        "namespace": "inference",
+        "claim_name": "model-store-fsx",
+        "zone": "us-west-2a",
+        "probe_dir": "e2e-dra-probe-abc123",
+        "probe_content": "dra-probe-abc123",
+    }
+    # This raises KeyError if the template references an unknown placeholder — the
+    # bug hit in e2e run 32761818991 (unescaped `$probe_path` etc.).
+    rendered = string.Template(resource).substitute(**subs)
+    # Sanity checks on the rendered output.
+    assert "e2e-dra-probe-abc123" in rendered, "probe_dir substitution didn't land"
+    assert "hello-fsx-write-check" in rendered, "shell literal string got clobbered by substitution"
+    # No unescaped shell vars remain — `$$` is the escape for the raw `$` in
+    # string.Template. If any `$$` survived to the rendered output, that's a bug.
+    assert "$$" not in rendered, "raw $$ leaked to rendered output (missed a substitution)"
+
+
+def test_fsx_vpc_endpoint_gated_on_enable_fsx() -> None:
+    """The FSx interface VPC endpoint MUST exist and be gated on enable_fsx.
+
+    On the endpoints-only VPC posture (var.enable_nat_gateway=false, the default),
+    private subnets have NO internet route. The FSx CSI controller's Describe calls
+    (see the fsx_csi role in platform_fsx.tf) would hang against
+    fsx.<region>.amazonaws.com and PVC binds would fail. JGuinegagne blocking-
+    reliability finding on d7cfd9c (originally scoped to the hydration DRT path,
+    which has since moved to a KRO-managed track-deploy-time Job that does not
+    call the FSx API; the CSI controller need is what keeps this endpoint load-
+    bearing).
+
+    The endpoint MUST use `private_dns_enabled = true` so the AWS SDK resolves
+    fsx.<region>.amazonaws.com to the endpoint transparently (no client tuning).
+    """
+    content = (ENGINE / "platform_fsx.tf").read_text()
+    endpoint = _resource(content, "aws_vpc_endpoint", "fsx")
+    assert "count = var.enable_fsx" in endpoint, (
+        "aws_vpc_endpoint.fsx must be gated on var.enable_fsx (~$14/mo per endpoint; "
+        "only pay it when FSx is actually on)"
+    )
+    assert re.search(r'service_name\s*=\s*"com\.amazonaws\.\$\{data\.aws_region\.current\.id\}\.fsx"', endpoint), (
+        "endpoint service_name must be com.amazonaws.<region>.fsx (the FSx interface endpoint)"
+    )
+    assert "private_dns_enabled = true" in endpoint, (
+        "private_dns_enabled must be true so the SDK resolves fsx.<region>.amazonaws.com "
+        "to the endpoint without client tuning"
+    )
+    assert 'vpc_endpoint_type   = "Interface"' in endpoint or 'vpc_endpoint_type = "Interface"' in endpoint, (
+        "vpc_endpoint_type must be Interface (fsx has no gateway endpoint)"
+    )
+
+
+def test_fsx_sg_rules_are_sg_referenced_not_cidr() -> None:
+    """FSx SG rules MUST source by SG reference (not CIDR).
+
+    CIDR-based rules — including 0.0.0.0/0 — do not satisfy EFA requirements even if they
+    allow all traffic on all ports (per the FSx docs), so an EFA-enabled NodePool that
+    tries to mount FSx would silently fail. Also verify the four Lustre-protocol ports
+    are opened both ways (988 + 1018-1023).
+    """
+    content = (ENGINE / "platform_fsx.tf").read_text()
+    # No CIDR sources anywhere in an SG rule body.
+    for kind in ("aws_vpc_security_group_ingress_rule", "aws_vpc_security_group_egress_rule"):
+        for name in re.findall(rf'resource\s+"{kind}"\s+"([^"]+)"', content):
+            block = _resource(content, kind, name)
+            assert "cidr_ipv4" not in block and "cidr_ipv6" not in block, (
+                f"{kind}.{name} must source by SG reference, not CIDR (EFA composition)"
+            )
+            assert "referenced_security_group_id" in block, f"{kind}.{name} missing referenced_security_group_id"
+
+    # 988 + 1018-1023 must appear on both ingress and egress sides.
+    for port_kw in ("from_port                    = 988", "from_port                    = 1018"):
+        assert content.count(port_kw) >= 2, f"expected multiple SG rules with {port_kw!r} (ingress + egress)"
+
+
+def test_fsx_csi_role_uses_pod_identity_and_least_privilege() -> None:
+    """The FSx CSI controller SA MUST authenticate via Pod Identity to a dedicated role
+    scoped to Describe-only actions (static provisioning). Explicitly NOT AmazonFSxFullAccess
+    — that managed policy grants Delete/Update, giving a chart-supply-chain compromise
+    enough authority to nuke the file system AND hang jd down on state drift.
+    """
+    content = (ENGINE / "platform_fsx.tf").read_text()
+    role = re.search(r'module\s+"fsx_csi_role"\s*\{(.*?)\n\}', content, re.DOTALL)
+    assert role is not None
+    role_body = role.group(1)
+    assert "pod_identity_trust" in role_body, "FSx CSI role must use the shared pod_identity_trust doc"
+    # Explicit deny-list: no managed AmazonFSxFullAccess (too broad — includes Delete/Update).
+    assert "AmazonFSxFullAccess" not in content, (
+        "FSx CSI role must NOT attach AmazonFSxFullAccess (grants Delete/Update on every FS in "
+        "the account — least-privilege violation the rest of this repo doesn't tolerate)"
+    )
+
+    # A dedicated Describe-only inline policy MUST exist on the role.
+    doc = _extract_block(content, "data", "aws_iam_policy_document", "fsx_csi")
+    assert "fsx:DescribeFileSystems" in doc, "fsx_csi inline policy must grant DescribeFileSystems"
+    # Anything mutating on FSx is explicitly forbidden by this shape.
+    for forbidden in ("fsx:DeleteFileSystem", "fsx:UpdateFileSystem", "fsx:CreateFileSystem"):
+        assert forbidden not in doc, (
+            f"fsx_csi inline policy MUST NOT grant {forbidden} — static provisioning does not need it"
+        )
+    inline = _resource(content, "aws_iam_role_policy", "fsx_csi")
+    assert "module.fsx_csi_role[0].role_name" in inline, "inline policy must attach to the FSx CSI role"
+
+    assoc = _resource(content, "aws_eks_pod_identity_association", "fsx_csi")
+    assert 'service_account = "fsx-csi-controller-sa"' in assoc, (
+        "Pod Identity association must bind the fsx-csi-controller-sa SA"
+    )
+    assert "module.fsx_csi_role[0].role_arn" in assoc, "Pod Identity association must use the gated FSx CSI role"
+
+
+def test_storage_chart_wires_fsx_values_conditionally() -> None:
+    """The storage helm_release MUST pass fsx.enabled to the chart (always) and inject the
+    file system id / dns name / mount name / capacity only when var.enable_fsx is true.
+
+    The chart's fsx-mount.yaml short-circuits on `fsx.enabled: false`, so unconditional
+    injection is safe but wasted API traffic; a var.enable_fsx-gated concat() keeps plan
+    diffs quiet when FSx is off.
+    """
+    block = _resource((ENGINE / "platform_storage.tf").read_text(), "helm_release", "storage")
+    assert '"fsx.enabled"' in block, "storage chart must always receive fsx.enabled"
+    assert "var.enable_fsx ?" in block, "FSx set values must be conditional on var.enable_fsx"
+    for key in ("fsx.fileSystemId", "fsx.dnsName", "fsx.mountName"):
+        assert f'"{key}"' in block, f"storage chart missing FSx wiring for {key}"
+    assert "aws_fsx_lustre_file_system.shared[0]" in block, "FSx values must reference the gated FSx FS resource"
+
+
+def test_fsx_pv_template_is_gated_by_values_flag() -> None:
+    """The FSx PV/PVC chart template MUST be wrapped in `if .Values.fsx.enabled` so a chart
+    render with fsx.enabled=false produces zero PV/PVC objects (the FSx-off default)."""
+    tmpl = (CHARTS / "storage" / "templates" / "fsx-mount.yaml").read_text()
+    assert "if .Values.fsx.enabled" in tmpl, "fsx-mount.yaml must be gated on .Values.fsx.enabled"
+    # The FSx CSI driver requires <fs-id>::<mount-name> for volumeHandle (not the fs-id alone).
+    assert "{{ .Values.fsx.fileSystemId }}::{{ .Values.fsx.mountName }}" in tmpl, (
+        "volumeHandle MUST be <fs-id>::<mount-name> for the FSx CSI driver (not just the FS id)"
+    )
+    # flock is the load-bearing mount option for SafeTensors / mmap consumers.
+    assert "flock" in tmpl, "FSx PV must mount with flock (POSIX file locks)"
+
+
+def test_fsx_pv_has_az_node_affinity() -> None:
+    """The FSx PV MUST embed a topology.kubernetes.io/zone nodeAffinity pointing at
+    the FSx AZ. Without it, workloads that mount the PVC can schedule cross-AZ and
+    every read/write silently pays inter-AZ transfer + higher latency.
+
+    Terraform passes fsx.availabilityZone into the chart set-values in
+    platform_storage.tf; the PV template consumes it here.
+    """
+    tmpl = (CHARTS / "storage" / "templates" / "fsx-mount.yaml").read_text()
+    assert "nodeAffinity:" in tmpl, "FSx PV must have spec.nodeAffinity (AZ-pin the workload)"
+    assert "topology.kubernetes.io/zone" in tmpl, "PV nodeAffinity must be keyed on topology.kubernetes.io/zone"
+    assert "{{ .Values.fsx.availabilityZone" in tmpl, (
+        "PV nodeAffinity zone value must be templated from .Values.fsx.availabilityZone"
+    )
+    # And the storage chart wiring must actually pass the AZ through.
+    storage = _resource((ENGINE / "platform_storage.tf").read_text(), "helm_release", "storage")
+    assert '"fsx.availabilityZone"' in storage, (
+        "helm_release.storage must set fsx.availabilityZone (from data.aws_subnet.fsx[0].availability_zone)"
+    )
+
+
+def test_fsx_per_unit_throughput_derives_from_gpu_capacity() -> None:
+    """The presets ship `fsx_per_unit_storage_throughput = 0` as a sentinel and
+    platform_fsx.tf derives the actual value from BOTH the P-pool flag AND total
+    GPU capacity (var.gpu_g_capacity + var.gpu_p_capacity). Big P-heavy clusters
+    (> 60 GPUs) get bumped to 1000 MB/s/TiB so cold-scale-out doesn't cap.
+
+    Cold-scale-out (K new pods on K new nodes at once) is the real saturation
+    risk — Lustre's per-node cache absorbs steady-state reads but not first-touch
+    reads. Kueue's nominalQuota mirrors these capacity vars, so this is the exact
+    concurrent-reader ceiling.
+    """
+    fsx = (ENGINE / "platform_fsx.tf").read_text()
+    presets = (ENGINE / "presets" / "defaults-all.tfvars").read_text()
+    # Preset sentinel is 0.
+    assert re.search(r"fsx_per_unit_storage_throughput\s*=\s*0\b", presets), (
+        "preset must ship fsx_per_unit_storage_throughput = 0 (sentinel meaning auto-derive)"
+    )
+    # platform_fsx.tf has the derivation local referencing enable_gpu_p_nodepool
+    # AND both GPU capacity variables.
+    assert "local.fsx_per_unit_storage_throughput" in fsx, (
+        "platform_fsx.tf must reference local.fsx_per_unit_storage_throughput on the FS resource"
+    )
+    assert "var.enable_gpu_p_nodepool" in fsx, "the derivation local must branch on var.enable_gpu_p_nodepool"
+    assert "var.gpu_g_capacity" in fsx and "var.gpu_p_capacity" in fsx, (
+        "the derivation local must consider total GPU capacity (gpu_g + gpu_p) — cold-scale-out "
+        "of many pods is the real saturation risk, and Kueue nominalQuota mirrors these vars"
+    )
+    # Assert the three tier thresholds appear in the file (250, 500, 1000).
+    for tier in ("250", "500", "1000"):
+        assert re.search(rf"\b{tier}\b", fsx), f"derivation must produce tier {tier}"
+
+
+def test_fsx_platform_info_configmap_is_discoverable() -> None:
+    """The fsx-platform-info ConfigMap MUST publish every field a consumer needs
+    to consume FSx from a Kubernetes-native surface — replaces the deploy-time
+    `jupyter-deploy show --output NAME` + Python substitution dance with a
+    declarative K8s object.
+
+    Consumers (KRO blocks, workload initContainers, kubectl scripts) discover
+    this by the `platform.inference/kind: storage` label — the peer
+    s3-mount-platform-info ConfigMap shares that label.
+    """
+    cm = _resource((ENGINE / "platform_fsx.tf").read_text(), "kubernetes_config_map_v1", "fsx_platform_info")
+    # Gated on enable_fsx (otherwise there's no FSx to describe).
+    assert "count = var.enable_fsx" in cm, "fsx-platform-info ConfigMap must be gated on enable_fsx"
+    # Namespace = the shared workload namespace (where consumers live).
+    assert "kubernetes_namespace_v1.workload.metadata[0].name" in cm, (
+        "fsx-platform-info ConfigMap must live in the workload namespace, not kube-system"
+    )
+    # Grouping label so consumers list by kind, not by name.
+    assert '"platform.inference/kind"    = "storage"' in cm.replace("  ", " ").replace("  ", " ") or re.search(
+        r'"platform\.inference/kind"\s*=\s*"storage"', cm
+    ), "ConfigMap must carry platform.inference/kind = storage for label-based discovery"
+    # Every field a KRO block or initContainer needs.
+    required_keys = (
+        "fileSystemId",
+        "dnsName",
+        "mountName",
+        "availabilityZone",
+        "dataRepositoryPath",
+        "mountPath",
+        "storageCapacityGib",
+        "perUnitThroughputMBpsPerTiB",
+        "aggregateGBpsMax",
+        "platformPvcName",
+    )
+    for key in required_keys:
+        assert f"{key}" in cm, f"fsx-platform-info ConfigMap missing data key '{key}'"
+
+
+def test_s3_mount_platform_info_configmap_is_discoverable() -> None:
+    """The s3-mount-platform-info ConfigMap MUST ship UNCONDITIONALLY (S3-mount is
+    always on) as a peer to fsx-platform-info, so tracks can enumerate every
+    available storage backend by listing `-l platform.inference/kind=storage` in
+    the workload namespace — one API surface across backends, not "check for
+    ConfigMap X else hardcode name Y."
+
+    Peer invariants with fsx-platform-info:
+      - workload namespace (same as FSx peer)
+      - platform.inference/kind = storage label
+      - platform.inference/backend = s3-mount label (backend-specific)
+      - platformPvcName + platformPvcNamespace so tracks discover the PVC
+        location without hardcoding
+      - capabilities string so tracks that need RWX/POSIX reject S3-mount on
+        read rather than failing at pod-schedule time
+    """
+    cm = _resource(
+        (ENGINE / "platform_storage.tf").read_text(),
+        "kubernetes_config_map_v1",
+        "s3_mount_platform_info",
+    )
+    # UNCONDITIONAL — no count expression at all (S3-mount is always installed).
+    assert "count =" not in cm, (
+        "s3-mount-platform-info ConfigMap must ship unconditionally — S3-mount is always on, unlike FSx which is opt-in"
+    )
+    # Workload namespace — where consumers live.
+    assert "kubernetes_namespace_v1.workload.metadata[0].name" in cm, (
+        "s3-mount-platform-info ConfigMap must live in the workload namespace"
+    )
+    # Discovery label + backend identifier.
+    assert re.search(r'"platform\.inference/kind"\s*=\s*"storage"', cm), (
+        "ConfigMap must carry platform.inference/kind = storage (peer with fsx-platform-info)"
+    )
+    assert re.search(r'"platform\.inference/backend"\s*=\s*"s3-mount"', cm), (
+        "ConfigMap must carry platform.inference/backend = s3-mount"
+    )
+    # Every field a track needs to discover + evaluate S3-mount.
+    required_keys = (
+        "bucketName",
+        "region",
+        "modelsPrefix",
+        "mountPath",
+        "dataRepositoryPath",
+        "platformPvcName",
+        "platformPvcNamespace",
+        "capabilities",
+    )
+    for key in required_keys:
+        assert f"{key}" in cm, f"s3-mount-platform-info ConfigMap missing data key '{key}'"
+    # Capabilities MUST surface the constraint honestly — tracks that need RWX
+    # or full POSIX consult this to reject the backend on read.
+    assert "read-only" in cm and "partial-posix" in cm, (
+        "capabilities must surface Mountpoint's constraints (read-only + partial-posix) "
+        "so tracks reject the backend when they need RWX/full-POSIX"
+    )
+
+
+def test_fsx_observability_alarms_and_grafana_ds() -> None:
+    """Observability layer (platform_fsx_observability.tf) MUST ship:
+    - a CloudWatch log-metric-filter + alarm on FSx event log WARN/ERROR/FAILED
+    - a FreeDataStorageCapacity alarm keyed on 20% of provisioned capacity
+    - read + write throughput-saturation alarms at 70% of FS ceiling (15 min sustained)
+    - a Grafana CloudWatch data source with an IAM policy scoped to AWS/FSx
+    """
+    content = (ENGINE / "platform_fsx_observability.tf").read_text()
+    # Four alarms — capacity, event-log, read saturation, write saturation.
+    for alarm in ("fsx_events", "fsx_free_capacity", "fsx_read_saturation", "fsx_write_saturation"):
+        block = _resource(content, "aws_cloudwatch_metric_alarm", alarm)
+        assert "count = var.enable_fsx" in block, f"alarm '{alarm}' must be gated on enable_fsx"
+    # The capacity alarm's metric name MUST be FreeDataStorageCapacity — the Lustre-
+    # specific one. FreeStorageCapacity (no "Data") is FSx-Windows/ONTAP and Lustre
+    # never emits it, so an alarm on that name sits permanently in OK with
+    # `treat_missing_data = notBreaching`. Roborev Medium finding on `d7cfd9c`.
+    capacity_block = _resource(content, "aws_cloudwatch_metric_alarm", "fsx_free_capacity")
+    assert re.search(r'metric_name\s*=\s*"FreeDataStorageCapacity"', capacity_block), (
+        "fsx_free_capacity alarm MUST use metric_name = FreeDataStorageCapacity "
+        "(the Lustre metric). FreeStorageCapacity is Windows/ONTAP and Lustre never "
+        "emits it — alarm would sit permanently in OK."
+    )
+    # Saturation alarms MUST divide by the derived FS ceiling local (not hardcoded)
+    # so bumping fsx_per_unit_storage_throughput auto-retunes them.
+    for alarm in ("fsx_read_saturation", "fsx_write_saturation"):
+        block = _resource(content, "aws_cloudwatch_metric_alarm", alarm)
+        assert "local.fsx_throughput_5min_ceiling_bytes" in block, (
+            f"'{alarm}' expression must divide by local.fsx_throughput_5min_ceiling_bytes "
+            "(so alarm auto-tunes when the throughput tier is bumped)"
+        )
+        # 15-minute sustained window (3 × 5-min periods) so transient spikes
+        # (KEDA cold-start, hydration replay) don't page.
+        assert re.search(r"evaluation_periods\s*=\s*3\b", block), (
+            f"'{alarm}' must require 15 min sustained (evaluation_periods = 3) — otherwise "
+            "cold-scale-out spikes false-positive"
+        )
+    # Log-metric filter wired.
+    lmf = _resource(content, "aws_cloudwatch_log_metric_filter", "fsx_events")
+    assert "aws_cloudwatch_log_group.fsx[0].name" in lmf, "log-metric-filter must target the FSx event log group"
+    # Grafana CW IAM: action-scoped only. cloudwatch:namespace is NOT a valid
+    # condition key for GetMetricData/ListMetrics/GetMetricStatistics per the
+    # CloudWatch Service Authorization Reference — only PutMetricData supports
+    # it. Namespace-restriction is enforced by the datasource's
+    # customMetricsNamespaces config, not IAM.
+    doc = _extract_block(content, "data", "aws_iam_policy_document", "grafana_cloudwatch")
+    assert "cloudwatch:namespace" not in doc, (
+        "Grafana CloudWatch policy must NOT set cloudwatch:namespace condition — it's not "
+        "a valid condition key for read actions and every request would silently AccessDenied"
+    )
+    assert "cloudwatch:GetMetricData" in doc, "policy must grant GetMetricData"
+    assert "cloudwatch:ListMetrics" in doc, "policy must grant ListMetrics (Grafana discovery)"
+    # Datasource ConfigMap has the grafana_datasource label the chart's sidecar watches.
+    cm = _resource(content, "kubernetes_config_map_v1", "grafana_fsx_datasource")
+    assert 'grafana_datasource = "1"' in cm, (
+        "Grafana datasource ConfigMap must carry the `grafana_datasource: 1` label for auto-discovery"
+    )
 
 
 def test_onboarder_backstop_and_workload_repos_cluster_scoped() -> None:

@@ -75,6 +75,13 @@ def test_health_cluster_layer(e2e_deployment: EndToEndDeployment) -> None:
 # healthy. See the manifest components: block + AGENT.md for the rationale.
 _GPU_DAEMONSET_COMPONENTS = {"dcgm-exporter", "nvidia-device-plugin"}
 
+# Opt-in components: only deployed when the matching `enable_*` var is true. On a default
+# cluster (enable_lws / enable_fsx = false) these have no Deployment/DaemonSet, so
+# `jd health` reports them as degraded — the correct signal so a track requiring
+# `platform: [lws|fsx]` can fail preflight loudly. Accept degraded (or healthy if the
+# cluster HAS enabled them); do NOT demand healthy.
+_OPTIN_COMPONENTS = {"lws", "fsx", "fsx-csi-node"}
+
 
 def _components_layers(e2e_deployment: EndToEndDeployment) -> list[dict]:
     """One `jd health --components --json` snapshot of the component rows."""
@@ -106,7 +113,11 @@ def test_health_components_layer(e2e_deployment: EndToEndDeployment) -> None:
     layers = _components_layers(e2e_deployment)
     while True:
         must_be_healthy = [
-            e for e in layers if e["name"] not in _GPU_DAEMONSET_COMPONENTS and not e["name"].endswith("-chart")
+            e
+            for e in layers
+            if e["name"] not in _GPU_DAEMONSET_COMPONENTS
+            and e["name"] not in _OPTIN_COMPONENTS
+            and not e["name"].endswith("-chart")
         ]
         # -chart HelmRelease twins are pod-count-agnostic and must be healthy too, but they are
         # not subject to the node-join race, so they gate on the same converged snapshot below.
@@ -130,6 +141,13 @@ def test_health_components_layer(e2e_deployment: EndToEndDeployment) -> None:
             # node happens to exist); the HelmRelease twin is asserted healthy below.
             assert entry["status_category"] in ("degraded", "healthy"), (
                 f"GPU DaemonSet '{entry['name']}' unexpected status: {entry['status_category']}"
+            )
+        elif entry["name"] in _OPTIN_COMPONENTS:
+            # enable_lws / enable_fsx are false by default → the Deployment/DaemonSet is
+            # not installed → jd health reports degraded. That's the correct signal for
+            # a track's preflight to fail on a cluster missing the feature.
+            assert entry["status_category"] in ("degraded", "healthy"), (
+                f"opt-in component '{entry['name']}' unexpected status: {entry['status_category']}"
             )
         else:
             assert entry["status_category"] == "healthy", (

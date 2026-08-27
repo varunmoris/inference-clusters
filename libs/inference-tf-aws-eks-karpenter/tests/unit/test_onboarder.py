@@ -257,13 +257,40 @@ class TestPathBGraph(unittest.TestCase):
             co.onboard(graph, tmp, _onboarder(runner))
             self.assertEqual(runner.ingested, [(source, f"{MODELS}/mock-tiny")])
 
-    def test_graph_without_image_paths_fails(self) -> None:
+    def test_graph_without_image_or_weight_paths_emits_pristine_air_gapped(self) -> None:
+        # Truly storage-only block (PV+PVC, no image refs anywhere): passthrough.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            graph = tmp / "storage-only"
+            graph.mkdir()
+            (graph / "graph.yaml").write_text(
+                "apiVersion: kro.run/v1alpha1\nkind: ResourceGraphDefinition\n"
+                "metadata: {name: storage-only}\nspec:\n  resources:\n"
+                "    - id: pvc\n      template:\n"
+                "        apiVersion: v1\n        kind: PersistentVolumeClaim\n"
+                "        metadata: {name: model-store-fsx}\n"
+            )
+            (graph / "values.yaml").write_text("images: []\nweights: []\n")
+            original = yaml.safe_load((graph / "graph.yaml").read_text())
+
+            result = co.onboard(graph, tmp, _onboarder(FakeRunner()))
+            self.assertEqual(result.output_basename, "graph-air-gapped.yaml")
+            emitted = yaml.safe_load(result.output_file.read_text())
+            self.assertEqual(emitted, original)
+
+    def test_graph_with_image_ref_but_empty_values_fails_loud(self) -> None:
+        # values.yaml declared empty but graph.yaml still has an image ref — the
+        # typo case (`image:` instead of `images:`). Must SystemExit at onboard
+        # time so it doesn't silently pass through and surface as ErrImagePull
+        # on the endpoints-only VPC at deploy time.
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             graph = self._stage(tmp, "mock-graph")
-            (graph / "values.yaml").write_text("images: []\n")
-            with self.assertRaises(SystemExit):
+            (graph / "values.yaml").write_text("images: []\nweights: []\n")
+            with self.assertRaises(SystemExit) as cm:
                 co.onboard(graph, tmp, _onboarder(FakeRunner()))
+            self.assertIn("image-like refs", str(cm.exception))
+            self.assertIn("busybox", str(cm.exception))
 
 
 class TestHuggingFaceIngest(unittest.TestCase):
