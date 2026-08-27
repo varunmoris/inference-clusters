@@ -2,12 +2,7 @@
 
 Module-scoped fixture flips `enable_fsx=true`, reapplies, yields; reverts on teardown so
 subsequent test sessions see the base state. All tests share one enable+revert cycle
-(FSx has an hourly cost floor). Assertions cover the full chain: TF outputs populated,
-FS + DRA reach AVAILABLE, CSI driver placed correctly, static PV/PVC bind, a consumer
-pod pinned to the FSx AZ does an RWX round-trip against /models, and — via a
-`FsxHydrate` CR against the platform-installed KRO RGD — a track-deploy-time
-hydration Job byte-warms a seeded prefix and touches the sentinel workload
-initContainers gate on (the lhnealreilly blocking-review path on d7cfd9c).
+(FSx has an hourly cost floor).
 """
 
 import contextlib
@@ -339,37 +334,14 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
     fsx_enabled: EndToEndDeployment,
     kubernetes_cluster_login: None,
 ) -> None:
-    """Track-deploy-time hydration path end-to-end: apply a FsxHydrate CR, KRO
-    expands it to a Job that byte-warms a seeded prefix and drops the sentinel
-    workload initContainers gate on.
-
-    Replaces the earlier `jd up`-time TF-managed Job that never had weights to
-    warm (lhnealreilly blocking review on d7cfd9c: "the onboarding is done after
-    the cluster is already live … we would need this hydration done as an async
-    job triggered when the deploy happens on the track resources"). The RGD
-    lives in the storage chart (fsx-hydrate-rgd.yaml, gated on fsx.enabled), so
-    the primitive is available the moment `enable_fsx=true` — a track just
-    applies a CR of kind `FsxHydrate` next to its workload.
-
-    Coverage:
-      1. RGD is installed and Active — the storage chart wired it up correctly.
-      2. Seeding s3://<model_store>/models/<prefix>/data.bin (bytes, not just
-         namespace) + DRA auto_import surfaces it in Lustre.
-      3. FsxHydrate CR triggers a Job that lands on the FSx AZ (nodeAffinity).
-      4. Job Completes within its activeDeadlineSeconds.
-      5. Sentinel `.hydrated-<slug>` exists at /models/ (workload initContainers'
-         gating file).
-      6. `lfs hsm_state` on the seeded file returns something other than
-         "released" (bytes are actually on Lustre OSTs, not just metadata).
-      7. Deleting the CR cascades the child Job away (the KRO reconcile property).
+    """Apply a FsxHydrate CR; KRO expands it into a Job that byte-warms a
+    seeded prefix and drops the sentinel workload initContainers gate on.
+    Also asserts the Job lands on the FSx AZ and the CR delete cascades the Job.
     """
     workload_ns = h.jd_output(fsx_enabled, "workload_namespace")
     zone = h.jd_output(fsx_enabled, "fsx_availability_zone")
     model_store = h.jd_output(fsx_enabled, "model_store_bucket")
 
-    # 1. RGD installed by the storage chart is Active. If this fails, either the
-    #    chart didn't render the template (fsx.enabled not passed) or KRO didn't
-    #    reconcile it (helm_release.storage lost its helm_release.kro dep_on).
     run_kubectl(
         "wait",
         "--for=jsonpath={.status.state}=Active",
@@ -378,32 +350,22 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
         check=True,
     )
 
-    # 2. Per-run unique prefix so re-runs against the same deployment don't
-    #    collide on stale Lustre entries / stale sentinels.
     run_id = uuid.uuid4().hex[:12]
     prefix = f"hydrate-e2e-{run_id}"
-    slug = prefix  # no `/` or `_` in the prefix → SLUG == prefix
-    cr_name = f"hydrate-{run_id}"  # DNS-1123
-    job_name = f"fsx-hydrate-{cr_name}"  # RGD's Job name template
+    cr_name = f"hydrate-{run_id}"
+    job_name = f"fsx-hydrate-{cr_name}"
     seed_key = f"models/{prefix}/data.bin"
-    # 4 KiB body — the DRT metadata layer only needs a file present; hsm_restore
-    # cost is proportional to bytes but we only need it to complete once.
     seed_body = b"x" * 4096
-    sentinel_path = f"/models/.hydrated-{slug}"
+    sentinel_path = f"/models/.hydrated-{prefix}"
 
     def _dump_hydrate_diagnostics(reason: str) -> str:
-        """kubectl-describe + kubectl-logs + recent events for the Job and any pod
-        it produced. Called on wait-timeout so the pytest failure captures WHY the
-        Job didn't Complete (dnf install failure, image pull error, Karpenter
-        starvation) rather than just "wait timed out". Returned as a single string
-        the AssertionError body embeds; nothing is asserted against it here."""
+        """Job + pod describe/logs + namespace events + RGD status, embedded
+        in the pytest AssertionError so a wait timeout carries WHY."""
         parts = [f"[hydrate-diag] {reason}"]
-        # Job describe: shows retry count, active/failed pods, condition/events.
         parts.append(
             "--- kubectl describe job ---\n"
             + run_kubectl("describe", "job", job_name, "-n", workload_ns, check=False).stdout
         )
-        # Every pod the Job ever produced (including CrashLoopBackOff retries).
         pods = run_kubectl(
             "get",
             "pods",
@@ -426,12 +388,10 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
                 + "\n---\n"
                 + run_kubectl("logs", p, "-n", workload_ns, "--tail=200", check=False).stdout
             )
-        # Recent namespace events — image pull failures, PVC bind stalls, etc.
         parts.append(
             "--- kubectl get events (last 30) ---\n"
             + run_kubectl("get", "events", "-n", workload_ns, "--sort-by=.lastTimestamp", check=False).stdout[-4000:]
         )
-        # RGD status — did KRO reconcile the CR?
         parts.append(
             "--- kubectl get resourcegraphdefinition/fsx-hydrate -o yaml ---\n"
             + run_kubectl("get", "resourcegraphdefinition/fsx-hydrate", "-o", "yaml", check=False).stdout
@@ -440,7 +400,6 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
 
     h.s3_put_object(model_store, seed_key, seed_body)
     try:
-        # 3. Apply the CR — KRO reconciles it into a Job.
         h.apply_resource(
             "fsx-hydrate-cr.yaml",
             namespace=workload_ns,
@@ -448,12 +407,6 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
             prefix=prefix,
         )
 
-        # 4. Job reaches Complete. First-time hydration budget: Karpenter must
-        #    provision a CPU node in the FSx AZ (2-3 min), FSx CSI attaches the
-        #    Lustre client (30-60s), the pod dnf-installs lustre2.15-client
-        #    (~30s), then hsm_restore + hsm_state polling on a 4 KiB file
-        #    finishes in seconds. 15-min ceiling is generous but keeps a stuck
-        #    Job from wedging the mutating suite.
         try:
             run_kubectl(
                 "wait",
@@ -471,9 +424,6 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
                 f"original error: {e}"
             ) from e
 
-        # Confirm the Job landed on the FSx AZ (defence against a stale
-        # affinity block — a wrong-AZ node would still schedule but every mount
-        # would pay inter-AZ transfer).
         job_pod = run_kubectl(
             "get",
             "pods",
@@ -494,16 +444,8 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
             r"jsonpath={.metadata.labels.topology\.kubernetes\.io/zone}",
             check=True,
         ).stdout.strip()
-        assert job_zone == zone, (
-            f"hydration Job landed in {job_zone!r} but FSx is in {zone!r} — "
-            "AZ affinity in fsx-hydrate-rgd.yaml regressed"
-        )
+        assert job_zone == zone, f"hydration Job landed in {job_zone!r} but FSx is in {zone!r} — AZ affinity regressed"
 
-        # 5. Probe via a short-lived busybox pod pinned to the FSx AZ: assert
-        #    the sentinel exists. The Job only touches the sentinel after every
-        #    file has been fully read (Lustre HSM restore is synchronous on
-        #    read), so sentinel presence is the entire contract — no separate
-        #    hsm_state check needed.
         probe_pod = f"fsx-hydrate-probe-{run_id}"
         h.apply_resource(
             "fsx-hydrate-probe.yaml",
@@ -549,7 +491,6 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
                 check=False,
             )
 
-        # 7. Deleting the CR cascades the Job away — KRO reconcile lifecycle.
         run_kubectl(
             "delete",
             "fsxhydrate",
@@ -560,7 +501,7 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
             check=True,
         )
         cascaded = False
-        for _ in range(24):  # ~2 min for the cascade
+        for _ in range(24):
             got = run_kubectl(
                 "get",
                 "job",
@@ -576,9 +517,8 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
                 cascaded = True
                 break
             time.sleep(5)
-        assert cascaded, "deleting the FsxHydrate CR must cascade-delete its child Job (KRO reconcile)"
+        assert cascaded, "deleting the FsxHydrate CR must cascade-delete its child Job"
     finally:
-        # CR + probe pod may have leaked past an assertion — best-effort cleanup.
         run_kubectl(
             "delete",
             "fsxhydrate",
@@ -589,6 +529,5 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
             "--wait=false",
             check=False,
         )
-        # DRA auto_export is off — the seed object stays in S3 until we clear it.
         with contextlib.suppress(Exception):
             h.s3_delete_object(model_store, seed_key)

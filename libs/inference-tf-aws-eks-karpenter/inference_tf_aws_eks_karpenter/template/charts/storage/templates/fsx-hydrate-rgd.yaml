@@ -1,20 +1,10 @@
 {{- /*
-FSx-for-Lustre byte-hydration primitive (KRO ResourceGraphDefinition).
-
-A track composes a `FsxHydrate` CR into its own KRO graph at TRACK-DEPLOY
-time (post onboarder — when the weights are in S3). KRO expands the CR into
-one Job that full-reads every file under models/<prefix>. Lustre HSM's
+FsxHydrate KRO RGD. A track composes a CR at track-deploy time; KRO expands
+it into a Job that full-reads every file under models/<prefix>. Lustre HSM's
 kernel-side implicit restore blocks each read until the file's bytes are on
-OSTs, so `cat > /dev/null` returning cleanly for every file IS the pre-warm.
-The Job then touches `.hydrated-<slug>` (slug = prefix with `/` → `-`); a
-workload initContainer gates on that file existing before starting.
-
-No `lfs` binary, no external network install — DRA `auto_import` covers
-metadata sync from S3, and the Lustre kernel driver on the host (loaded by
-the FSx CSI DaemonSet) covers restore. The container image needs only
-coreutils.
-
-Gated on `.Values.fsx.enabled` — the Job mounts the FSx PVC.
+OSTs, so a clean `cat > /dev/null` IS the pre-warm. Job then touches
+`.hydrated-<slug>` (slug = prefix with `/` → `-`); workload initContainers
+gate on it.
 */ -}}
 {{- if .Values.fsx.enabled }}
 apiVersion: kro.run/v1alpha1
@@ -26,9 +16,6 @@ spec:
     apiVersion: v1alpha1
     kind: FsxHydrate
     spec:
-      # S3-relative prefix under `models/` — matches the Lustre path.
-      # e.g. "qwen2.5-7b" hydrates s3://<model-store>/models/qwen2.5-7b/
-      # and produces sentinel /mnt/models/.hydrated-qwen2-5-7b.
       prefix: string | required=true
     status:
       succeeded: ${job.status.succeeded}
@@ -46,11 +33,7 @@ spec:
             app.kubernetes.io/managed-by: kro
         spec:
           backoffLimit: 3
-          # 2h ceiling — long enough for a full multi-GB prefix hsm_restore,
-          # short enough that a stuck FSx-S3 link (rate limit, misconfigured
-          # bucket policy) doesn't burn a Job indefinitely.
           activeDeadlineSeconds: 7200
-          # 24h reap window — keep for postmortem, then GC.
           ttlSecondsAfterFinished: 86400
           template:
             metadata:
@@ -59,9 +42,7 @@ spec:
                 app.kubernetes.io/component: hydration
             spec:
               restartPolicy: OnFailure
-              # AZ-pin to the FSx AZ. Cross-AZ metadata polling for the
-              # hsm_state loop is a real per-op latency tax we don't need to
-              # eat on hydration.
+              # Cross-AZ read of a single-AZ FSx pays inter-AZ latency on every op.
               affinity:
                 nodeAffinity:
                   requiredDuringSchedulingIgnoredDuringExecution:
@@ -71,9 +52,6 @@ spec:
                             operator: In
                             values:
                               - {{ .Values.fsx.availabilityZone | quote }}
-              # Tolerate the system MNG taint so the Job can land on the
-              # always-on system node if one is in the FSx AZ; otherwise
-              # Karpenter provisions a small CPU node in that AZ.
               tolerations:
                 - key: inference/role
                   operator: Equal
@@ -89,32 +67,20 @@ spec:
                   env:
                     - name: PREFIX
                       value: ${schema.spec.prefix}
-                  # Script is bash. `command` overrides the image's entrypoint;
-                  # args carries the -c payload. Env-var interpolation (not YAML
-                  # interpolation) is what feeds PREFIX into the script — KRO
-                  # substitutes the CR's spec.prefix into the env value, then
-                  # the shell reads it back as "$PREFIX" (quoted expansion, no
-                  # word-splitting).
                   command: ["/bin/bash", "-c"]
                   args:
                     - |
                       set -euo pipefail
 
-                      # Reject `..` in the caller-supplied prefix — the mount
-                      # only exposes /mnt/models, but a `..` prefix would let
-                      # the sentinel-touch escape into the container root.
+                      # Reject `..` so the sentinel-touch can't escape /mnt/models.
                       case "$PREFIX" in *..*|"") echo "[hydrate] FAIL: invalid PREFIX"; exit 1 ;; esac
 
                       mount | awk '$3 == "/mnt/models" && $5 == "lustre" { found=1 } END { exit !found }' \
                         || { echo "[hydrate] FAIL: /mnt/models is not lustre"; mount; exit 1; }
 
-                      # Slug: only `/` → `-`. Keep `_` distinct so `foo/bar`
-                      # and `foo_bar` don't share the same sentinel.
                       SLUG=$(printf %s "$PREFIX" | tr '/' '-')
 
-                      # DRA auto_import is async; wait for the prefix namespace
-                      # to surface. Hard-fail after 5 min so the Job doesn't
-                      # spin against an operator misconfiguration.
+                      # DRA auto_import is async — wait for the namespace to surface.
                       if [ ! -d "/mnt/models/$PREFIX" ]; then
                         echo "[hydrate] awaiting DRA import of /mnt/models/$PREFIX"
                         DEADLINE=$(( $(date +%s) + 300 ))
@@ -124,10 +90,6 @@ spec:
                         done
                       fi
 
-                      # Full-read every file — Lustre HSM restores a released
-                      # file synchronously on read (kernel-side implicit
-                      # restore), so `cat` returning cleanly for every file
-                      # means all bytes are on OSTs. No `lfs` binary required.
                       echo "[hydrate] pre-warm fan-out (P=32)"
                       find "/mnt/models/$PREFIX" -type f -print0 \
                         | xargs -0 -r -P 32 -n 1 sh -c 'cat "$0" > /dev/null'
@@ -138,8 +100,6 @@ spec:
                     requests:
                       cpu: "500m"
                       memory: 512Mi
-                    # No CPU limit — lfs is subject to LNet timeouts under CPU
-                    # throttling. Memory cap only.
                     limits:
                       memory: 2Gi
                   volumeMounts:

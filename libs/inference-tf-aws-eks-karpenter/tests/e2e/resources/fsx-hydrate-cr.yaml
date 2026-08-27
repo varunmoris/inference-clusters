@@ -1,20 +1,4 @@
-# A minimal FsxHydrate CR that exercises the platform-installed KRO RGD
-# (charts/storage/templates/fsx-hydrate-rgd.yaml). KRO expands this into a
-# single one-shot Job named `fsx-hydrate-<metadata.name>` that:
-#   1. dnf installs lustre2.15-client on amazonlinux:2023,
-#   2. verifies /mnt/models is a Lustre mount,
-#   3. `lfs setstripe` + `lfs hsm_restore` on `/mnt/models/${prefix}`,
-#   4. polls `lfs hsm_state` until nothing is "released",
-#   5. touches `/mnt/models/.hydrated-<slug>` (SLUG = prefix with / and _ → -).
-#
-# The e2e seeds a small object at s3://<model_store>/models/${prefix}/data.bin
-# BEFORE applying this CR; DRA auto_import (NEW/CHANGED events) propagates the
-# namespace into Lustre, and the Job then warms the bytes off S3.
-#
-# Substitutions (apply_resource → string.Template):
-#   ${namespace}  — workload namespace (from Terraform output)
-#   ${cr_name}    — DNS-1123 CR name (also drives the rendered Job name)
-#   ${prefix}     — the models/<prefix> subtree to hydrate
+# FsxHydrate CR for the hydration e2e.
 apiVersion: kro.run/v1alpha1
 kind: FsxHydrate
 metadata:

@@ -1,16 +1,4 @@
-# Short-lived probe pod for the hydration end-to-end. Mounts the same platform
-# FSx PVC as the hydration Job and checks the `.hydrated-<slug>` sentinel
-# exists — the Job only touches it after every file has been fully read
-# (Lustre HSM restore is synchronous on read), so sentinel presence is the
-# whole contract. Pinned to the FSx AZ (single-AZ FS).
-#
-# Substitutions (apply_resource → string.Template):
-#   ${pod}           — pod name (unique per run to avoid stale-object races)
-#   ${namespace}     — workload namespace
-#   ${image}         — any container with coreutils + a shell (busybox is fine)
-#   ${zone}          — FSx AZ (from Terraform output fsx_availability_zone)
-#   ${claim_name}    — FSx PVC name (model-store-fsx)
-#   ${sentinel_path} — /models/.hydrated-<slug> (test-computed)
+# Probe pod for the hydration e2e — asserts the sentinel exists.
 apiVersion: v1
 kind: Pod
 metadata:

@@ -845,100 +845,40 @@ def test_fsx_uses_persistent2_ssd_lz4_with_dra() -> None:
 
 
 def test_fsx_hydrate_rgd_shape() -> None:
-    """The FsxHydrate KRO RGD (charts/storage/templates/fsx-hydrate-rgd.yaml) is the
-    track-facing hydration primitive: a track composes a FsxHydrate CR into its own
-    graph next to the workload it wants pre-warmed, and KRO expands each CR to one
-    Job doing `lfs hsm_restore` on models/<prefix> then touching a `.hydrated-<slug>`
-    sentinel. Runs at TRACK-DEPLOY time (post onboarder), NOT `jd up` time — the
-    prior TF-managed Job fired at apply time when no weights were in S3 yet
-    (lhnealreilly blocking review on d7cfd9c).
-
-    Contract:
-      - Gated on .Values.fsx.enabled (only makes sense on FSx clusters).
-      - RGD kind is FsxHydrate with a required spec.prefix.
-      - Renders a batch/v1 Job that mounts the platform-owned FSx PVC.
-      - Job AZ-pins to .Values.fsx.availabilityZone (single-AZ FSx tax).
-      - Job body does hsm_restore + sentinel touch.
-      - Job sets activeDeadlineSeconds + ttlSecondsAfterFinished.
-    """
+    """FsxHydrate RGD contract: FSx-gated KRO RGD renders a Job that mounts the
+    platform PVC on the FSx AZ, full-reads the prefix (built-in HSM restore),
+    and touches the sentinel — no `lfs` / no `dnf install`."""
     tmpl_path = CHARTS / "storage" / "templates" / "fsx-hydrate-rgd.yaml"
-    assert tmpl_path.exists(), "fsx-hydrate-rgd.yaml must ship in the storage chart"
+    assert tmpl_path.exists()
     tmpl = tmpl_path.read_text()
 
-    # Gate on FSx being enabled.
-    assert "{{- if .Values.fsx.enabled }}" in tmpl, (
-        "fsx-hydrate-rgd.yaml must be gated on .Values.fsx.enabled — no FSx means no PVC to mount"
-    )
+    assert "{{- if .Values.fsx.enabled }}" in tmpl
+    assert "kind: ResourceGraphDefinition" in tmpl
+    assert re.search(r"kind:\s*FsxHydrate", tmpl)
+    assert re.search(r"prefix:\s*string\s*\|\s*required=true", tmpl)
+    assert re.search(r"apiVersion:\s*batch/v1", tmpl) and "kind: Job" in tmpl
+    assert "{{ .Values.fsx.claimName" in tmpl
+    assert "{{ .Values.fsx.availabilityZone" in tmpl
+    assert "topology.kubernetes.io/zone" in tmpl
+    assert "cat" in tmpl and "/dev/null" in tmpl
+    assert re.search(r"touch\s+.*hydrated-", tmpl)
+    assert "activeDeadlineSeconds" in tmpl
+    assert "ttlSecondsAfterFinished" in tmpl
 
-    # KRO RGD with the FsxHydrate kind and a required prefix schema field.
-    assert "kind: ResourceGraphDefinition" in tmpl, "must declare a KRO ResourceGraphDefinition"
-    assert re.search(r"kind:\s*FsxHydrate", tmpl), "RGD must define the FsxHydrate kind"
-    assert re.search(r"prefix:\s*string\s*\|\s*required=true", tmpl), (
-        "FsxHydrate.spec.prefix must be a required string (the caller-supplied models/<prefix>)"
-    )
-
-    # Renders a batch Job (not a Deployment, not a Pod) — hydration is one-shot.
-    assert re.search(r"apiVersion:\s*batch/v1", tmpl) and "kind: Job" in tmpl, (
-        "RGD must render a batch/v1 Job (one-shot; not a Deployment)"
-    )
-    # PVC name and AZ come from the storage chart values (single source of truth
-    # shared with fsx-mount.yaml — no duplication of the FSx AZ selection).
-    assert "{{ .Values.fsx.claimName" in tmpl, "Job must mount the platform-owned FSx PVC via .Values.fsx.claimName"
-    assert "{{ .Values.fsx.availabilityZone" in tmpl, (
-        "Job's nodeAffinity zone must come from .Values.fsx.availabilityZone (same source as PV)"
-    )
-    assert "topology.kubernetes.io/zone" in tmpl, "Job must nodeAffinity-pin to the FSx AZ"
-
-    # Load-bearing script bits: byte-warm + sentinel. Byte pre-warm rides on
-    # Lustre HSM's built-in kernel-side implicit restore — opening a released
-    # file blocks the read until every OST byte is back, so a full-file read
-    # (`cat > /dev/null`) is the whole pre-warm. No `lfs` binary → no `dnf
-    # install` in the pod → no external network → works on the endpoints-only
-    # VPC in any region (roborev 62303c3 Medium: an fsx-lustre-client-repo
-    # install path is us-east-1-only via the S3 gateway endpoint).
-    assert "cat" in tmpl and "/dev/null" in tmpl, (
-        "hydration script must full-read every file (cat > /dev/null) to trigger Lustre's "
-        "built-in implicit HSM restore; no client install"
-    )
-    assert re.search(r"touch\s+.*hydrated-", tmpl), "hydration script must touch the .hydrated-<slug> sentinel"
-
-    # Regression guard: never reintroduce a Lustre-client install or a
-    # cross-region S3 fetch (fsx-lustre-client-repo is us-east-1; the S3
-    # gateway endpoint only routes same-region traffic).
+    # Regression guard: pre-warm rides on the built-in HSM restore-on-read; a
+    # client install path (dnf/lustre-client repo) is a cross-region trap
+    # (fsx-lustre-client-repo is us-east-1-only via the S3 gateway endpoint).
     for banned in ("dnf install", "lustre2.15-client", "fsx-lustre-client-repo", "kmod-lustre-client"):
-        assert banned not in tmpl, (
-            f"hydration script must not contain {banned!r} — the platform's built-in "
-            "HSM restore-on-read handles byte pre-warm; a client install path is a regression"
-        )
+        assert banned not in tmpl, f"regression: hydration script must not contain {banned!r}"
 
-    # Safety caps — matches the equivalent settings on any TF-side Job.
-    assert "activeDeadlineSeconds" in tmpl, "Job must set activeDeadlineSeconds (hard kill for stuck restores)"
-    assert "ttlSecondsAfterFinished" in tmpl, "Job must set ttlSecondsAfterFinished (postmortem-then-reap)"
-
-    # Storage chart wiring MUST pass the hydrator image via the pull-through
-    # cache — nodes on the endpoints-only VPC can't reach public.ecr.aws.
     storage = _resource((ENGINE / "platform_storage.tf").read_text(), "helm_release", "storage")
-    assert '"fsx.hydrator.image"' in storage, (
-        "helm_release.storage must set fsx.hydrator.image (the container image the RGD renders into the Job)"
-    )
-    assert "ecr-public/amazonlinux/amazonlinux" in storage, (
-        "hydrator image must be sourced via the ECR pull-through cache (nodes can't reach public.ecr.aws directly)"
-    )
-
-    # And the storage release must depend on the KRO controller release, since
-    # this template registers a kro.run/v1alpha1 kind whose CRD ships with it.
-    assert "helm_release.kro" in storage, (
-        "helm_release.storage must depend_on helm_release.kro — the FsxHydrate RGD requires the KRO CRD"
-    )
+    assert '"fsx.hydrator.image"' in storage
+    assert "ecr-public/amazonlinux/amazonlinux" in storage
+    assert "helm_release.kro" in storage, "storage release must depend on the KRO CRD"
 
 
 def test_fsx_hydrate_cr_template_renders_with_expected_subs() -> None:
-    """apply_resource() feeds tests/e2e/resources/fsx-hydrate-cr.yaml through
-    string.Template.substitute() with a fixed set of placeholders. Every `$var`
-    / `${var}` in the template that is NOT one of those placeholders MUST be
-    `$$var` (shell literal) — otherwise the render raises KeyError at CI time
-    (~30-min feedback loop). This test catches that class of bug locally.
-    """
+    """Guard against unescaped `$var` outside the expected placeholder set."""
     resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-hydrate-cr.yaml").read_text()
     subs = {
         "namespace": "inference",
@@ -946,12 +886,12 @@ def test_fsx_hydrate_cr_template_renders_with_expected_subs() -> None:
         "prefix": "hydrate-e2e-abc123",
     }
     rendered = string.Template(resource).substitute(**subs)
-    assert "hydrate-abc123" in rendered, "cr_name substitution didn't land"
-    assert "prefix: hydrate-e2e-abc123" in rendered, "prefix substitution didn't land"
+    assert "hydrate-abc123" in rendered
+    assert "prefix: hydrate-e2e-abc123" in rendered
 
 
 def test_fsx_hydrate_probe_template_renders_with_expected_subs() -> None:
-    """Same shape-check for tests/e2e/resources/fsx-hydrate-probe.yaml."""
+    """Same guard for fsx-hydrate-probe.yaml."""
     resource = (TEMPLATE_PATH.parent.parent / "tests/e2e/resources/fsx-hydrate-probe.yaml").read_text()
     subs = {
         "pod": "fsx-hydrate-probe-abc123",
@@ -962,9 +902,9 @@ def test_fsx_hydrate_probe_template_renders_with_expected_subs() -> None:
         "sentinel_path": "/models/.hydrated-hydrate-e2e-abc123",
     }
     rendered = string.Template(resource).substitute(**subs)
-    assert "fsx-hydrate-probe-abc123" in rendered, "pod substitution didn't land"
-    assert "/models/.hydrated-hydrate-e2e-abc123" in rendered, "sentinel_path substitution didn't land"
-    assert "$$" not in rendered, "raw $$ leaked to rendered output (missed a substitution)"
+    assert "fsx-hydrate-probe-abc123" in rendered
+    assert "/models/.hydrated-hydrate-e2e-abc123" in rendered
+    assert "$$" not in rendered, "raw $$ leaked to rendered output"
 
 
 def test_fsx_consumer_template_renders_with_expected_subs() -> None:
