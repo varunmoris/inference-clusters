@@ -180,16 +180,17 @@ def split_image_ref(ref: str) -> tuple[str, str, str | None]:
 
 
 def _looks_like_image_ref(s: str) -> bool:
-    """True if `s` is shaped like a container image ref (has a `:tag` or
-    `@sha256:` digest). Weight-source URIs (s3://, hf://) and bare paths
-    (models/foo) are excluded."""
+    """True if `s` is shaped like a container image ref: an `@sha256:` digest,
+    or a multi-segment path with a `:tag` after the last `/`. Weight-source
+    URIs (s3://, hf://), bare paths (models/foo), and colon-bearing non-image
+    scalars (2:09:00, host:8080) are all excluded."""
     if " " in s or "\n" in s or "://" in s:
         return False
     if "@sha256:" in s:
         return True
-    if "/" in s:
-        return ":" in s[s.rfind("/") :]  # tag lives after the last `/`
-    return ":" in s and not s.startswith(":")
+    if "/" not in s:
+        return False
+    return ":" in s[s.rfind("/") :]
 
 
 def _find_stray_image_refs(obj: Any, seen: list[str] | None = None) -> list[str]:
