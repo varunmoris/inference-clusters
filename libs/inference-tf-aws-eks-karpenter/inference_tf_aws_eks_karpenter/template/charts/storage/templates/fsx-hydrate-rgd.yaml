@@ -1,27 +1,20 @@
 {{- /*
 FSx-for-Lustre byte-hydration primitive (KRO ResourceGraphDefinition).
 
-Ships a `FsxHydrate` kind so a track composes hydration into its own KRO graph
-next to the workload it wants pre-warmed. Applied at TRACK-DEPLOY time (post
-onboarder — when the weights are actually in S3), not at `jd up` time.
+A track composes a `FsxHydrate` CR into its own KRO graph at TRACK-DEPLOY
+time (post onboarder — when the weights are in S3). KRO expands the CR into
+one Job that full-reads every file under models/<prefix>. Lustre HSM's
+kernel-side implicit restore blocks each read until the file's bytes are on
+OSTs, so `cat > /dev/null` returning cleanly for every file IS the pre-warm.
+The Job then touches `.hydrated-<slug>` (slug = prefix with `/` → `-`); a
+workload initContainer gates on that file existing before starting.
 
-A `FsxHydrate` CR expands to one Job that:
-  1. Installs the Lustre client (lustre2.15-client) and asserts /mnt/models is
-     lustre.
-  2. `lfs setstripe -c -1 -S 4M` on the prefix subtree so files land striped
-     across every OST (parallel-read on future first-touch too).
-  3. `find | xargs -P 32 lfs hsm_restore` fan-out to pull object bytes off S3
-     onto Lustre OSTs.
-  4. Polls `lfs hsm_state` until nothing is "released", then touches
-     `.hydrated-<slug>` in the mount root so workload initContainers can gate
-     on it (SLUG = prefix with `/` and `_` replaced by `-`).
+No `lfs` binary, no external network install — DRA `auto_import` covers
+metadata sync from S3, and the Lustre kernel driver on the host (loaded by
+the FSx CSI DaemonSet) covers restore. The container image needs only
+coreutils.
 
-DRA `auto_import_policy = ["NEW","CHANGED"]` handles metadata sync from S3, so
-the Job does NOT need any AWS API access — no ServiceAccount role, no Pod
-Identity, no DRT. Data motion is pure Lustre client talking to the FSx SG.
-
-Gated on `.Values.fsx.enabled` because the RGD only makes sense on FSx
-clusters (the pod mounts the FSx PVC).
+Gated on `.Values.fsx.enabled` — the Job mounts the FSx PVC.
 */ -}}
 {{- if .Values.fsx.enabled }}
 apiVersion: kro.run/v1alpha1
@@ -107,68 +100,38 @@ spec:
                     - |
                       set -euo pipefail
 
-                      echo "[hydrate] install lustre-client"
-                      dnf install -y --quiet lustre2.15-client findutils >/dev/null
+                      # Reject `..` in the caller-supplied prefix — the mount
+                      # only exposes /mnt/models, but a `..` prefix would let
+                      # the sentinel-touch escape into the container root.
+                      case "$PREFIX" in *..*|"") echo "[hydrate] FAIL: invalid PREFIX"; exit 1 ;; esac
 
-                      echo "[hydrate] verify /mnt/models is lustre"
                       mount | awk '$3 == "/mnt/models" && $5 == "lustre" { found=1 } END { exit !found }' \
                         || { echo "[hydrate] FAIL: /mnt/models is not lustre"; mount; exit 1; }
 
-                      # Slug: strip characters not valid in a POSIX filename we
-                      # want workload initContainers to gate on. /-and-_ → -.
-                      SLUG=$(printf %s "$PREFIX" | tr '/_' '--')
+                      # Slug: only `/` → `-`. Keep `_` distinct so `foo/bar`
+                      # and `foo_bar` don't share the same sentinel.
+                      SLUG=$(printf %s "$PREFIX" | tr '/' '-')
 
-                      # 1. Stripe across every OST so future writes/reads under
-                      #    the prefix parallelize (setstripe applies to a dir;
-                      #    inherited by new files created inside).
-                      if [ -d "/mnt/models/$PREFIX" ]; then
-                        echo "[hydrate] lfs setstripe /mnt/models/$PREFIX"
-                        lfs setstripe -c -1 -S 4M "/mnt/models/$PREFIX" || echo "[hydrate] setstripe warning (non-fatal)"
-                      else
-                        # DRA auto_import is async; the prefix may not have
-                        # surfaced in Lustre yet. Wait up to 5 min for the
-                        # namespace-import event; give up after that.
-                        echo "[hydrate] awaiting DRA import of /mnt/models/$PREFIX (auto_import is async)"
-                        WAIT_DEADLINE=$(( $(date +%s) + 300 ))
+                      # DRA auto_import is async; wait for the prefix namespace
+                      # to surface. Hard-fail after 5 min so the Job doesn't
+                      # spin against an operator misconfiguration.
+                      if [ ! -d "/mnt/models/$PREFIX" ]; then
+                        echo "[hydrate] awaiting DRA import of /mnt/models/$PREFIX"
+                        DEADLINE=$(( $(date +%s) + 300 ))
                         until [ -d "/mnt/models/$PREFIX" ]; do
-                          [ "$(date +%s)" -ge "$WAIT_DEADLINE" ] && { echo "[hydrate] FAIL: /mnt/models/$PREFIX never appeared"; exit 1; }
+                          [ "$(date +%s)" -ge "$DEADLINE" ] && { echo "[hydrate] FAIL: /mnt/models/$PREFIX never appeared"; exit 1; }
                           sleep 10
                         done
-                        lfs setstripe -c -1 -S 4M "/mnt/models/$PREFIX" || echo "[hydrate] setstripe warning (non-fatal)"
                       fi
 
-                      # 2. Fan out hsm_restore across the tree.
-                      echo "[hydrate] hsm_restore fan-out (P=32)"
+                      # Full-read every file — Lustre HSM restores a released
+                      # file synchronously on read (kernel-side implicit
+                      # restore), so `cat` returning cleanly for every file
+                      # means all bytes are on OSTs. No `lfs` binary required.
+                      echo "[hydrate] pre-warm fan-out (P=32)"
                       find "/mnt/models/$PREFIX" -type f -print0 \
-                        | xargs -0 -r -P 32 -n 32 lfs hsm_restore 2>/dev/null || true
+                        | xargs -0 -r -P 32 -n 1 sh -c 'cat "$0" > /dev/null'
 
-                      # 3. Poll until every file is EXISTS (not released).
-                      #    Inner deadline is a soft cap; activeDeadlineSeconds
-                      #    is the hard kill at the K8s layer.
-                      #
-                      #    `lfs hsm_state` prints one line per file:
-                      #      <path>: (0xHEX) [flag1 flag2 ...][, archive_id:N]
-                      #    The `released` state flag appears in the flags list,
-                      #    NOT the path — but a naive `grep released` would also
-                      #    match a filename like `released-v2/...` and never let
-                      #    PENDING reach 0 (roborev 532f0d3 Medium). Strip the
-                      #    path prefix via sed before grep so the match is bound
-                      #    to the flags portion only.
-                      echo "[hydrate] awaiting hsm_state != released"
-                      DEADLINE=$(( $(date +%s) + 5400 ))
-                      while :; do
-                        PENDING=$(find "/mnt/models/$PREFIX" -type f -print0 \
-                          | xargs -0 -r -n 64 lfs hsm_state 2>/dev/null \
-                          | sed -E 's/^[^:]+: \(0x[0-9a-fA-F]+\) //' \
-                          | grep -c "released" || true)
-                        [ "$PENDING" -eq 0 ] && break
-                        echo "[hydrate] $PENDING files still released — waiting"
-                        [ "$(date +%s)" -ge "$DEADLINE" ] && \
-                          { echo "[hydrate] soft timeout — $PENDING files still released"; exit 1; }
-                        sleep 30
-                      done
-
-                      # 4. Sentinel — workload initContainers gate on this file existing.
                       touch "/mnt/models/.hydrated-$SLUG"
                       echo "[hydrate] OK — .hydrated-$SLUG"
                   resources:

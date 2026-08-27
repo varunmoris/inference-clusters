@@ -366,10 +366,6 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
     workload_ns = h.jd_output(fsx_enabled, "workload_namespace")
     zone = h.jd_output(fsx_enabled, "fsx_availability_zone")
     model_store = h.jd_output(fsx_enabled, "model_store_bucket")
-    registry = h.jd_output(fsx_enabled, "ecr_registry")
-    # Same image the RGD renders into the Job — reusing here for the probe pod
-    # avoids a second image pull on the FSx-AZ node.
-    hydrator_image = f"{registry}/ecr-public/amazonlinux/amazonlinux:2023"
 
     # 1. RGD installed by the storage chart is Active. If this fails, either the
     #    chart didn't render the template (fsx.enabled not passed) or KRO didn't
@@ -503,23 +499,20 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
             "AZ affinity in fsx-hydrate-rgd.yaml regressed"
         )
 
-        # 5+6. Probe via a short-lived busybox pod pinned to the FSx AZ:
-        #      assert the sentinel exists and print `lfs hsm_state` for the seeded
-        #      file (bytes are on OSTs iff hsm_state does NOT say "released").
-        #      Amazonlinux for `lfs`; busybox has no Lustre client and can only
-        #      stat/read files, which is enough for the sentinel check. Use the
-        #      hydrator image (already pulled to nodes in this AZ) for
-        #      hsm_state — same shape as the Job, so no cold pull tax.
+        # 5. Probe via a short-lived busybox pod pinned to the FSx AZ: assert
+        #    the sentinel exists. The Job only touches the sentinel after every
+        #    file has been fully read (Lustre HSM restore is synchronous on
+        #    read), so sentinel presence is the entire contract — no separate
+        #    hsm_state check needed.
         probe_pod = f"fsx-hydrate-probe-{run_id}"
         h.apply_resource(
             "fsx-hydrate-probe.yaml",
             pod=probe_pod,
             namespace=workload_ns,
-            image=hydrator_image,
+            image=h.client_image(fsx_enabled),
             zone=zone,
             claim_name="model-store-fsx",
             sentinel_path=sentinel_path,
-            seed_path=f"/models/{prefix}/data.bin",
         )
         try:
             try:
@@ -543,9 +536,6 @@ def test_fsx_hydrate_cr_warms_prefix_and_writes_sentinel(
             logs = run_kubectl("logs", probe_pod, "-n", workload_ns, check=True).stdout
             assert "[probe] sentinel OK" in logs, (
                 f"probe pod completed but sentinel {sentinel_path} was missing; logs:\n{logs[-2000:]}"
-            )
-            assert "[probe] hsm_state OK" in logs, (
-                f"probe pod completed but seeded file was still `released` (bytes not on OSTs); logs:\n{logs[-2000:]}"
             )
         finally:
             run_kubectl(

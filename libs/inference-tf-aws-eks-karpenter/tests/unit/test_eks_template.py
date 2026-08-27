@@ -889,23 +889,27 @@ def test_fsx_hydrate_rgd_shape() -> None:
     )
     assert "topology.kubernetes.io/zone" in tmpl, "Job must nodeAffinity-pin to the FSx AZ"
 
-    # Load-bearing script bits: byte-warm + sentinel.
-    assert "lfs hsm_restore" in tmpl, "hydration script must fan out lfs hsm_restore on the prefix"
+    # Load-bearing script bits: byte-warm + sentinel. Byte pre-warm rides on
+    # Lustre HSM's built-in kernel-side implicit restore — opening a released
+    # file blocks the read until every OST byte is back, so a full-file read
+    # (`cat > /dev/null`) is the whole pre-warm. No `lfs` binary → no `dnf
+    # install` in the pod → no external network → works on the endpoints-only
+    # VPC in any region (roborev 62303c3 Medium: an fsx-lustre-client-repo
+    # install path is us-east-1-only via the S3 gateway endpoint).
+    assert "cat" in tmpl and "/dev/null" in tmpl, (
+        "hydration script must full-read every file (cat > /dev/null) to trigger Lustre's "
+        "built-in implicit HSM restore; no client install"
+    )
     assert re.search(r"touch\s+.*hydrated-", tmpl), "hydration script must touch the .hydrated-<slug> sentinel"
 
-    # The `released`-state polling loop MUST strip the path before matching, or
-    # it false-matches on filenames like `released-v2/…` and never lets PENDING
-    # reach 0 — the Job then exits 1 after its inner soft deadline (5400s) and
-    # hydration silently fails for every prefix containing "released" as a
-    # substring in any path (roborev 532f0d3 Medium). Anchor the fix here: a
-    # naive `grep -c "released"` on raw `lfs hsm_state` output is a regression.
-    hsm_state_block = re.search(r"lfs hsm_state.*?done", tmpl, re.DOTALL)
-    assert hsm_state_block is not None, "hydration script must contain an hsm_state polling loop"
-    hsm_state_block_text = hsm_state_block.group(0)
-    assert re.search(r"sed\s+.*\)\s*//", hsm_state_block_text) or "awk" in hsm_state_block_text, (
-        "hsm_state polling loop must strip the file path (sed/awk) before matching `released` — "
-        "a bare `grep released` false-matches filenames like `released-v2/...` and hangs the Job"
-    )
+    # Regression guard: never reintroduce a Lustre-client install or a
+    # cross-region S3 fetch (fsx-lustre-client-repo is us-east-1; the S3
+    # gateway endpoint only routes same-region traffic).
+    for banned in ("dnf install", "lustre2.15-client", "fsx-lustre-client-repo", "kmod-lustre-client"):
+        assert banned not in tmpl, (
+            f"hydration script must not contain {banned!r} — the platform's built-in "
+            "HSM restore-on-read handles byte pre-warm; a client install path is a regression"
+        )
 
     # Safety caps — matches the equivalent settings on any TF-side Job.
     assert "activeDeadlineSeconds" in tmpl, "Job must set activeDeadlineSeconds (hard kill for stuck restores)"
@@ -952,17 +956,14 @@ def test_fsx_hydrate_probe_template_renders_with_expected_subs() -> None:
     subs = {
         "pod": "fsx-hydrate-probe-abc123",
         "namespace": "inference",
-        "image": "1234.dkr.ecr.us-west-2.amazonaws.com/ecr-public/amazonlinux/amazonlinux:2023",
+        "image": "1234.dkr.ecr.us-west-2.amazonaws.com/ecr-public/docker/library/busybox:1.36",
         "zone": "us-west-2a",
         "claim_name": "model-store-fsx",
         "sentinel_path": "/models/.hydrated-hydrate-e2e-abc123",
-        "seed_path": "/models/hydrate-e2e-abc123/data.bin",
     }
     rendered = string.Template(resource).substitute(**subs)
     assert "fsx-hydrate-probe-abc123" in rendered, "pod substitution didn't land"
     assert "/models/.hydrated-hydrate-e2e-abc123" in rendered, "sentinel_path substitution didn't land"
-    # `$$` -> `$` after render; anything still spelled `$$` here would mean the
-    # source used `$$$` or `$$$$` (four dollars) — an escape typo.
     assert "$$" not in rendered, "raw $$ leaked to rendered output (missed a substitution)"
 
 
