@@ -13,7 +13,7 @@
 # Substitutions (apply_resource → string.Template):
 #   ${pod}           — pod name (unique per run to avoid stale-object races)
 #   ${namespace}     — workload namespace
-#   ${image}         — amazonlinux via ECR pull-through (has lustre2.15-client)
+#   ${image}         — amazonlinux via ECR pull-through (installs lustre-client at start)
 #   ${zone}          — FSx AZ (from Terraform output fsx_availability_zone)
 #   ${claim_name}    — FSx PVC name (model-store-fsx)
 #   ${sentinel_path} — /models/.hydrated-<slug> (test-computed)
@@ -43,10 +43,11 @@ spec:
         - |
           set -euo pipefail
 
-          # We need the Lustre client for `lfs hsm_state`. The mount itself is
-          # handed to us by the FSx CSI plugin (no client-install needed to see
-          # files) — but hsm_state is a Lustre-userspace tool.
-          dnf install -y --quiet lustre2.15-client >/dev/null
+          # lfs hsm_state — Lustre userspace tool, not in AL2023 default repos.
+          rpm --import https://fsx-lustre-client-repo-public-keys.s3.amazonaws.com/fsx-al2023.asc
+          curl -fsSL https://fsx-lustre-client-repo.s3.amazonaws.com/al/2023/fsx-lustre-client.repo \
+            -o /etc/yum.repos.d/aws-fsx.repo
+          dnf install -y --quiet lustre-client >/dev/null
 
           echo "[probe] sentinel check: ${sentinel_path}"
           if [ ! -f "${sentinel_path}" ]; then

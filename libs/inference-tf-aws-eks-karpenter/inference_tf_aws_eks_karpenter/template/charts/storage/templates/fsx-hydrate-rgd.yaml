@@ -107,8 +107,13 @@ spec:
                     - |
                       set -euo pipefail
 
+                      # Lustre client isn't in AL2023 default repos; pull the
+                      # AWS-hosted repo (S3, reachable via the S3 gateway).
                       echo "[hydrate] install lustre-client"
-                      dnf install -y --quiet lustre2.15-client findutils >/dev/null
+                      rpm --import https://fsx-lustre-client-repo-public-keys.s3.amazonaws.com/fsx-al2023.asc
+                      curl -fsSL https://fsx-lustre-client-repo.s3.amazonaws.com/al/2023/fsx-lustre-client.repo \
+                        -o /etc/yum.repos.d/aws-fsx.repo
+                      dnf install -y --quiet lustre-client findutils >/dev/null
 
                       echo "[hydrate] verify /mnt/models is lustre"
                       mount | awk '$3 == "/mnt/models" && $5 == "lustre" { found=1 } END { exit !found }' \
